@@ -25,6 +25,7 @@
 ├── satellite_grid_partition_v1.py   # 主算法与文件运行入口
 ├── run_satellite_grid.py            # 推荐的终端运行入口
 ├── amap_grid_viewer.py               # 单个专员格高德地图预览
+├── gcj02_to_wgs84_batch.py           # 独立的客户坐标反算实验工具
 ├── column_config.example.json        # 自定义输入列名模板
 ├── requirements.txt                 # Python 依赖
 ├── README.md                        # 项目概览与快速开始
@@ -158,6 +159,31 @@ python -m http.server 8000
 ```
 
 浏览器打开 `http://localhost:8000/amap_grid_preview.html`。无需在高德控制台手工上传经纬度；模块会读取所选 Grid 的完整 Polygon/MultiPolygon。
+
+## 单独测试 GCJ-02 反算
+
+`gcj02_to_wgs84_batch.py` 与主算法相互独立，可在 Notebook 中批量转换客户点，用于控制点实验和人工抽样检查：
+
+```python
+import pandas as pd
+from gcj02_to_wgs84_batch import convert_customer_coordinates
+
+customer_df = pd.read_excel("客户数据.xlsx")
+
+coordinate_check = convert_customer_coordinates(
+    customer_df,
+    customer_id_col="客户号",
+    gcj_lng_col="客户经度",
+    gcj_lat_col="客户纬度",
+)
+
+coordinate_check.to_excel(
+    "客户坐标_GCJ与WGS估算对照.xlsx",
+    index=False,
+)
+```
+
+其中 `model_roundtrip_error_m` 仅表示公开模型内部的正反算残差，不能作为相对于真实 WGS84 的误差。
 
 ## 重要数据口径
 
