@@ -10,6 +10,7 @@
 4. 输出的 WGS84 是“公开模型下的估计值”，不是高德官方提供或认证的反向结果。
 5. model_roundtrip_error_m 只表示公开模型内部的回算残差很小，不能证明
    wgs84_lng_est / wgs84_lat_est 就是真实原始 WGS84。
+6. DataFrame 中的坐标反算、回算验证和距离计算均使用 NumPy 向量化执行。
 
 Notebook 示例
 -------------
@@ -26,7 +27,7 @@ result = convert_customer_coordinates(
 )
 
 result.head()
-result.to_excel("客户坐标_GCJ与WGS估算对照.xlsx", index=False)
+result.to_parquet("客户坐标_GCJ与WGS估算对照.parquet", index=False)
 """
 
 from __future__ import annotations
@@ -188,6 +189,147 @@ def gcj02_to_wgs84(
     return wgs_lng, wgs_lat
 
 
+def wgs84_to_gcj02_array(
+    lng: np.ndarray,
+    lat: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """NumPy 向量化的 WGS84 -> GCJ-02，返回顺序为（经度，纬度）。"""
+    lng_array, lat_array = np.broadcast_arrays(
+        np.asarray(lng, dtype=np.float64),
+        np.asarray(lat, dtype=np.float64),
+    )
+    output_lng = lng_array.copy()
+    output_lat = lat_array.copy()
+
+    inside = (
+        np.isfinite(lng_array)
+        & np.isfinite(lat_array)
+        & (lng_array >= 72.004)
+        & (lng_array <= 137.8347)
+        & (lat_array >= 0.8293)
+        & (lat_array <= 55.8271)
+    )
+    if not np.any(inside):
+        return output_lng, output_lat
+
+    current_lng = lng_array[inside]
+    current_lat = lat_array[inside]
+    lng_offset = current_lng - 105.0
+    lat_offset = current_lat - 35.0
+
+    dlat = (
+        -100.0
+        + 2.0 * lng_offset
+        + 3.0 * lat_offset
+        + 0.2 * lat_offset * lat_offset
+        + 0.1 * lng_offset * lat_offset
+        + 0.2 * np.sqrt(np.abs(lng_offset))
+    )
+    dlat += (
+        20.0 * np.sin(6.0 * lng_offset * _PI)
+        + 20.0 * np.sin(2.0 * lng_offset * _PI)
+    ) * 2.0 / 3.0
+    dlat += (
+        20.0 * np.sin(lat_offset * _PI)
+        + 40.0 * np.sin(lat_offset / 3.0 * _PI)
+    ) * 2.0 / 3.0
+    dlat += (
+        160.0 * np.sin(lat_offset / 12.0 * _PI)
+        + 320.0 * np.sin(lat_offset * _PI / 30.0)
+    ) * 2.0 / 3.0
+
+    dlng = (
+        300.0
+        + lng_offset
+        + 2.0 * lat_offset
+        + 0.1 * lng_offset * lng_offset
+        + 0.1 * lng_offset * lat_offset
+        + 0.1 * np.sqrt(np.abs(lng_offset))
+    )
+    dlng += (
+        20.0 * np.sin(6.0 * lng_offset * _PI)
+        + 20.0 * np.sin(2.0 * lng_offset * _PI)
+    ) * 2.0 / 3.0
+    dlng += (
+        20.0 * np.sin(lng_offset * _PI)
+        + 40.0 * np.sin(lng_offset / 3.0 * _PI)
+    ) * 2.0 / 3.0
+    dlng += (
+        150.0 * np.sin(lng_offset / 12.0 * _PI)
+        + 300.0 * np.sin(lng_offset / 30.0 * _PI)
+    ) * 2.0 / 3.0
+
+    radlat = np.deg2rad(current_lat)
+    magic = np.sin(radlat)
+    magic = 1.0 - _EE * magic * magic
+    sqrt_magic = np.sqrt(magic)
+    dlat = (
+        dlat
+        * 180.0
+        / ((_A * (1.0 - _EE)) / (magic * sqrt_magic) * _PI)
+    )
+    dlng = (
+        dlng
+        * 180.0
+        / (_A / sqrt_magic * np.cos(radlat) * _PI)
+    )
+
+    output_lng[inside] = current_lng + dlng
+    output_lat[inside] = current_lat + dlat
+    return output_lng, output_lat
+
+
+def gcj02_to_wgs84_array(
+    lng: np.ndarray,
+    lat: np.ndarray,
+    *,
+    tolerance: float = 1e-7,
+    max_iterations: int = 10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """NumPy 向量化的 GCJ-02 -> WGS84 固定点迭代反算。"""
+    if tolerance <= 0:
+        raise ValueError("tolerance 必须 > 0。")
+    if max_iterations <= 0:
+        raise ValueError("max_iterations 必须是正整数。")
+
+    original_lng, original_lat = np.broadcast_arrays(
+        np.asarray(lng, dtype=np.float64),
+        np.asarray(lat, dtype=np.float64),
+    )
+    wgs_lng = original_lng.copy()
+    wgs_lat = original_lat.copy()
+    active = (
+        np.isfinite(original_lng)
+        & np.isfinite(original_lat)
+        & (original_lng >= 72.004)
+        & (original_lng <= 137.8347)
+        & (original_lat >= 0.8293)
+        & (original_lat <= 55.8271)
+    )
+
+    for _ in range(max_iterations):
+        active_positions = np.flatnonzero(active)
+        if active_positions.size == 0:
+            break
+
+        predicted_lng, predicted_lat = wgs84_to_gcj02_array(
+            wgs_lng[active_positions],
+            wgs_lat[active_positions],
+        )
+        delta_lng = original_lng[active_positions] - predicted_lng
+        delta_lat = original_lat[active_positions] - predicted_lat
+        wgs_lng[active_positions] += delta_lng
+        wgs_lat[active_positions] += delta_lat
+
+        converged = (
+            (np.abs(delta_lng) <= tolerance)
+            & (np.abs(delta_lat) <= tolerance)
+        )
+        active[active_positions[converged]] = False
+
+    return wgs_lng, wgs_lat
+
+
 def _haversine_distance_m(
     lng1: float,
     lat1: float,
@@ -213,6 +355,36 @@ def _haversine_distance_m(
     )
 
 
+def _haversine_distance_m_array(
+    lng1: np.ndarray,
+    lat1: np.ndarray,
+    lng2: np.ndarray,
+    lat2: np.ndarray,
+) -> np.ndarray:
+    """向量化计算两组经纬度数值之间的大圆距离，单位米。"""
+    lng1_array, lat1_array, lng2_array, lat2_array = np.broadcast_arrays(
+        np.asarray(lng1, dtype=np.float64),
+        np.asarray(lat1, dtype=np.float64),
+        np.asarray(lng2, dtype=np.float64),
+        np.asarray(lat2, dtype=np.float64),
+    )
+    phi1 = np.deg2rad(lat1_array)
+    phi2 = np.deg2rad(lat2_array)
+    dphi = np.deg2rad(lat2_array - lat1_array)
+    dlambda = np.deg2rad(lng2_array - lng1_array)
+    value = (
+        np.sin(dphi / 2.0) ** 2
+        + np.cos(phi1)
+        * np.cos(phi2)
+        * np.sin(dlambda / 2.0) ** 2
+    )
+    value = np.clip(value, 0.0, 1.0)
+    return 2.0 * _EARTH_RADIUS_M * np.arctan2(
+        np.sqrt(value),
+        np.sqrt(1.0 - value),
+    )
+
+
 def convert_customer_coordinates(
     customer_df: pd.DataFrame,
     *,
@@ -223,7 +395,7 @@ def convert_customer_coordinates(
     max_iterations: int = 10,
 ) -> pd.DataFrame:
     """
-    批量转换客户 DataFrame，并保留全部原始字段。
+    用 NumPy 向量化批量转换客户 DataFrame，并保留全部原始字段。
 
     新增字段
     --------
@@ -268,58 +440,62 @@ def convert_customer_coordinates(
         & result["gcj02_lat"].between(-90, 90)
     )
 
-    output_columns = [
-        "wgs84_lng_est",
-        "wgs84_lat_est",
-        "gcj_wgs_numeric_shift_m",
-        "roundtrip_gcj02_lng",
-        "roundtrip_gcj02_lat",
-        "model_roundtrip_error_m",
-    ]
-    for column in output_columns:
-        result[column] = np.nan
-    result["conversion_status"] = "INVALID_COORDINATE"
+    valid_mask = valid.to_numpy(dtype=bool)
+    gcj_lng_all = result["gcj02_lng"].to_numpy(dtype=np.float64)
+    gcj_lat_all = result["gcj02_lat"].to_numpy(dtype=np.float64)
+    valid_lng = gcj_lng_all[valid_mask]
+    valid_lat = gcj_lat_all[valid_mask]
 
-    for index in result.index[valid]:
-        gcj_lng = float(result.at[index, "gcj02_lng"])
-        gcj_lat = float(result.at[index, "gcj02_lat"])
+    wgs_lng, wgs_lat = gcj02_to_wgs84_array(
+        valid_lng,
+        valid_lat,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+    )
+    roundtrip_lng, roundtrip_lat = wgs84_to_gcj02_array(
+        wgs_lng,
+        wgs_lat,
+    )
 
-        wgs_lng, wgs_lat = gcj02_to_wgs84(
-            gcj_lng,
-            gcj_lat,
-            tolerance=tolerance,
-            max_iterations=max_iterations,
-        )
-        roundtrip_lng, roundtrip_lat = wgs84_to_gcj02(
+    def expand_valid(values: np.ndarray) -> np.ndarray:
+        expanded = np.full(len(result), np.nan, dtype=np.float64)
+        expanded[valid_mask] = values
+        return expanded
+
+    result["wgs84_lng_est"] = expand_valid(wgs_lng)
+    result["wgs84_lat_est"] = expand_valid(wgs_lat)
+    result["gcj_wgs_numeric_shift_m"] = expand_valid(
+        _haversine_distance_m_array(
+            valid_lng,
+            valid_lat,
             wgs_lng,
             wgs_lat,
         )
+    )
+    result["roundtrip_gcj02_lng"] = expand_valid(roundtrip_lng)
+    result["roundtrip_gcj02_lat"] = expand_valid(roundtrip_lat)
+    result["model_roundtrip_error_m"] = expand_valid(
+        _haversine_distance_m_array(
+            valid_lng,
+            valid_lat,
+            roundtrip_lng,
+            roundtrip_lat,
+        )
+    )
 
-        result.at[index, "wgs84_lng_est"] = wgs_lng
-        result.at[index, "wgs84_lat_est"] = wgs_lat
-        result.at[index, "gcj_wgs_numeric_shift_m"] = (
-            _haversine_distance_m(
-                gcj_lng,
-                gcj_lat,
-                wgs_lng,
-                wgs_lat,
-            )
-        )
-        result.at[index, "roundtrip_gcj02_lng"] = roundtrip_lng
-        result.at[index, "roundtrip_gcj02_lat"] = roundtrip_lat
-        result.at[index, "model_roundtrip_error_m"] = (
-            _haversine_distance_m(
-                gcj_lng,
-                gcj_lat,
-                roundtrip_lng,
-                roundtrip_lat,
-            )
-        )
-        result.at[index, "conversion_status"] = (
-            "OUTSIDE_MODEL_AREA_UNCHANGED"
-            if _outside_gcj02_area(gcj_lng, gcj_lat)
-            else "ESTIMATED"
-        )
+    status = np.full(len(result), "INVALID_COORDINATE", dtype=object)
+    inside_model_area = (
+        (valid_lng >= 72.004)
+        & (valid_lng <= 137.8347)
+        & (valid_lat >= 0.8293)
+        & (valid_lat <= 55.8271)
+    )
+    status[valid_mask] = np.where(
+        inside_model_area,
+        "ESTIMATED",
+        "OUTSIDE_MODEL_AREA_UNCHANGED",
+    )
+    result["conversion_status"] = status
 
     return result
 
@@ -382,4 +558,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

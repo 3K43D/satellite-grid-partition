@@ -558,17 +558,156 @@ def gcj02_to_wgs84(
     return wgs_lng, wgs_lat
 
 
-def _transform_geometry_coordinates(geom, converter):
-    """对 Shapely Geometry 的每个顶点执行坐标转换。"""
+def wgs84_to_gcj02_array(
+    lng: np.ndarray,
+    lat: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """NumPy 向量化的 WGS84 -> GCJ-02。"""
+    lng_array, lat_array = np.broadcast_arrays(
+        np.asarray(lng, dtype=np.float64),
+        np.asarray(lat, dtype=np.float64),
+    )
+    output_lng = lng_array.copy()
+    output_lat = lat_array.copy()
+    inside = (
+        np.isfinite(lng_array)
+        & np.isfinite(lat_array)
+        & (lng_array >= 72.004)
+        & (lng_array <= 137.8347)
+        & (lat_array >= 0.8293)
+        & (lat_array <= 55.8271)
+    )
+    if not np.any(inside):
+        return output_lng, output_lat
+
+    current_lng = lng_array[inside]
+    current_lat = lat_array[inside]
+    lng_offset = current_lng - 105.0
+    lat_offset = current_lat - 35.0
+
+    dlat = (
+        -100.0
+        + 2.0 * lng_offset
+        + 3.0 * lat_offset
+        + 0.2 * lat_offset * lat_offset
+        + 0.1 * lng_offset * lat_offset
+        + 0.2 * np.sqrt(np.abs(lng_offset))
+    )
+    dlat += (
+        20.0 * np.sin(6.0 * lng_offset * _GCJ_PI)
+        + 20.0 * np.sin(2.0 * lng_offset * _GCJ_PI)
+    ) * 2.0 / 3.0
+    dlat += (
+        20.0 * np.sin(lat_offset * _GCJ_PI)
+        + 40.0 * np.sin(lat_offset / 3.0 * _GCJ_PI)
+    ) * 2.0 / 3.0
+    dlat += (
+        160.0 * np.sin(lat_offset / 12.0 * _GCJ_PI)
+        + 320.0 * np.sin(lat_offset * _GCJ_PI / 30.0)
+    ) * 2.0 / 3.0
+
+    dlng = (
+        300.0
+        + lng_offset
+        + 2.0 * lat_offset
+        + 0.1 * lng_offset * lng_offset
+        + 0.1 * lng_offset * lat_offset
+        + 0.1 * np.sqrt(np.abs(lng_offset))
+    )
+    dlng += (
+        20.0 * np.sin(6.0 * lng_offset * _GCJ_PI)
+        + 20.0 * np.sin(2.0 * lng_offset * _GCJ_PI)
+    ) * 2.0 / 3.0
+    dlng += (
+        20.0 * np.sin(lng_offset * _GCJ_PI)
+        + 40.0 * np.sin(lng_offset / 3.0 * _GCJ_PI)
+    ) * 2.0 / 3.0
+    dlng += (
+        150.0 * np.sin(lng_offset / 12.0 * _GCJ_PI)
+        + 300.0 * np.sin(lng_offset / 30.0 * _GCJ_PI)
+    ) * 2.0 / 3.0
+
+    radlat = np.deg2rad(current_lat)
+    magic = np.sin(radlat)
+    magic = 1.0 - _GCJ_EE * magic * magic
+    sqrt_magic = np.sqrt(magic)
+    dlat = (
+        dlat
+        * 180.0
+        / (
+            (_GCJ_A * (1.0 - _GCJ_EE))
+            / (magic * sqrt_magic)
+            * _GCJ_PI
+        )
+    )
+    dlng = (
+        dlng
+        * 180.0
+        / (_GCJ_A / sqrt_magic * np.cos(radlat) * _GCJ_PI)
+    )
+    output_lng[inside] = current_lng + dlng
+    output_lat[inside] = current_lat + dlat
+    return output_lng, output_lat
+
+
+def gcj02_to_wgs84_array(
+    lng: np.ndarray,
+    lat: np.ndarray,
+    tolerance: float = 1e-7,
+    max_iterations: int = 10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """NumPy 向量化的 GCJ-02 -> WGS84 固定点迭代反算。"""
+    original_lng, original_lat = np.broadcast_arrays(
+        np.asarray(lng, dtype=np.float64),
+        np.asarray(lat, dtype=np.float64),
+    )
+    wgs_lng = original_lng.copy()
+    wgs_lat = original_lat.copy()
+    active = (
+        np.isfinite(original_lng)
+        & np.isfinite(original_lat)
+        & (original_lng >= 72.004)
+        & (original_lng <= 137.8347)
+        & (original_lat >= 0.8293)
+        & (original_lat <= 55.8271)
+    )
+
+    for _ in range(max_iterations):
+        active_positions = np.flatnonzero(active)
+        if active_positions.size == 0:
+            break
+        converted_lng, converted_lat = wgs84_to_gcj02_array(
+            wgs_lng[active_positions],
+            wgs_lat[active_positions],
+        )
+        delta_lng = original_lng[active_positions] - converted_lng
+        delta_lat = original_lat[active_positions] - converted_lat
+        wgs_lng[active_positions] += delta_lng
+        wgs_lat[active_positions] += delta_lat
+        converged = (
+            (np.abs(delta_lng) <= tolerance)
+            & (np.abs(delta_lat) <= tolerance)
+        )
+        active[active_positions[converged]] = False
+
+    return wgs_lng, wgs_lat
+
+
+def _transform_geometry_coordinates(geom, vectorized_converter):
+    """向量化转换 Shapely Geometry 的所有顶点。"""
     def transform_xy(x, y, z=None):
-        try:
-            converted = [converter(float(lng), float(lat)) for lng, lat in zip(x, y)]
-            new_x = [item[0] for item in converted]
-            new_y = [item[1] for item in converted]
-            return (new_x, new_y) if z is None else (new_x, new_y, z)
-        except TypeError:
-            new_x, new_y = converter(float(x), float(y))
-            return (new_x, new_y) if z is None else (new_x, new_y, z)
+        x_array = np.asarray(x, dtype=np.float64)
+        y_array = np.asarray(y, dtype=np.float64)
+        scalar_input = x_array.ndim == 0
+        new_x, new_y = vectorized_converter(
+            np.atleast_1d(x_array),
+            np.atleast_1d(y_array),
+        )
+        if scalar_input:
+            converted_xy = (float(new_x[0]), float(new_y[0]))
+        else:
+            converted_xy = (new_x, new_y)
+        return converted_xy if z is None else (*converted_xy, z)
 
     return shapely_transform(transform_xy, geom)
 
@@ -578,14 +717,14 @@ def geometry_to_wgs84(geom, source_coordinate_system: str):
     source = normalize_coordinate_system(source_coordinate_system)
     if geom is None or geom.is_empty or source == "WGS84":
         return geom
-    return _transform_geometry_coordinates(geom, gcj02_to_wgs84)
+    return _transform_geometry_coordinates(geom, gcj02_to_wgs84_array)
 
 
 def geometry_to_gcj02(geom):
     """将 WGS84 Geometry 转为高德地图使用的 GCJ-02。"""
     if geom is None or geom.is_empty:
         return geom
-    return _transform_geometry_coordinates(geom, wgs84_to_gcj02)
+    return _transform_geometry_coordinates(geom, wgs84_to_gcj02_array)
 
 
 # ============================================================
@@ -1337,21 +1476,25 @@ def prepare_customers_and_attach_fyp(
     source_coordinate_system = normalize_coordinate_system(
         config.input_coordinate_system
     )
-    wgs84_coordinates: List[Tuple[float, float]] = []
-    for _, row in cust.iterrows():
-        if not bool(row["_valid_coordinate"]):
-            wgs84_coordinates.append((np.nan, np.nan))
-        elif source_coordinate_system == "GCJ02":
-            wgs84_coordinates.append(
-                gcj02_to_wgs84(row["_lng"], row["_lat"])
-            )
-        else:
-            wgs84_coordinates.append(
-                (float(row["_lng"]), float(row["_lat"]))
-            )
+    valid_coordinate_mask = cust["_valid_coordinate"].to_numpy(dtype=bool)
+    input_lng = cust["_lng"].to_numpy(dtype=np.float64)
+    input_lat = cust["_lat"].to_numpy(dtype=np.float64)
+    wgs84_lng = np.full(len(cust), np.nan, dtype=np.float64)
+    wgs84_lat = np.full(len(cust), np.nan, dtype=np.float64)
 
-    cust["_wgs84_lng"] = [item[0] for item in wgs84_coordinates]
-    cust["_wgs84_lat"] = [item[1] for item in wgs84_coordinates]
+    if source_coordinate_system == "GCJ02":
+        converted_lng, converted_lat = gcj02_to_wgs84_array(
+            input_lng[valid_coordinate_mask],
+            input_lat[valid_coordinate_mask],
+        )
+    else:
+        converted_lng = input_lng[valid_coordinate_mask]
+        converted_lat = input_lat[valid_coordinate_mask]
+
+    wgs84_lng[valid_coordinate_mask] = converted_lng
+    wgs84_lat[valid_coordinate_mask] = converted_lat
+    cust["_wgs84_lng"] = wgs84_lng
+    cust["_wgs84_lat"] = wgs84_lat
     cust["_input_coordinate_system"] = source_coordinate_system
 
     cust["_fyp_available"] = cust["_fyp"].notna()

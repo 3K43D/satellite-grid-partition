@@ -177,11 +177,14 @@ coordinate_check = convert_customer_coordinates(
     gcj_lat_col="客户纬度",
 )
 
-coordinate_check.to_excel(
-    "客户坐标_GCJ与WGS估算对照.xlsx",
+coordinate_check.to_parquet(
+    "客户坐标_GCJ与WGS估算对照.parquet",
     index=False,
 )
 ```
+
+坐标反算、回算验证和距离指标都使用 NumPy 向量化执行；
+所有原始字段和验证字段保留不变。百万级数据建议读写 Parquet。
 
 其中 `model_roundtrip_error_m` 仅表示公开模型内部的正反算残差，不能作为相对于真实 WGS84 的误差。
 
