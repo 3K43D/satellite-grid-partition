@@ -1,0 +1,21 @@
+{
+  "customer_id": "customer_id",
+  "customer_city": "city",
+  "customer_lng": "lng",
+  "customer_lat": "lat",
+  "customer_admin_code": "area_admin_code",
+  "customer_expected_fyp": "expected_fyp",
+  "admin_city": "city",
+  "admin_code": "area_code",
+  "admin_name": "area_name",
+  "admin_geometry": "area_geometry",
+  "existing_city": "city",
+  "existing_agent_grid_id": "agent_net_id",
+  "existing_basic_grid_id": "basic_net_id",
+  "existing_geometry": "basic_net_geom",
+  "threshold_city": "city",
+  "threshold_fyp": "target_expected_fyp",
+  "distance_city": "city",
+  "distance_km": "distance_km"
+}
+

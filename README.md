@@ -2,11 +2,12 @@
 
 基于行政街道边界、既有基础网格、客户位置、城市 FYP 门槛和距离门槛，使用 H3 与事务式 BFS 自动生成卫星网点专员格。
 
-当前版本：**V1.1**。
+当前版本：**V1.2**。
 
 ## 核心规则
 
 - H3 分辨率默认为 9。
+- 当前客户点、行政街道和已有网格输入坐标系为 GCJ-02；算法先转换为 WGS84 再调用 H3。
 - H3 行政归属和既有网格占用均按 **H3 中心点落入 Polygon** 判断。
 - 每个“城市 × 行政街道”独立划分，不跨行政街道生长。
 - 城市距离参数按专员格最大跨度（直径）解释，算法半径为 `distance_km / 2`。
@@ -22,6 +23,9 @@
 ```text
 .
 ├── satellite_grid_partition_v1.py   # 主算法与文件运行入口
+├── run_satellite_grid.py            # 推荐的终端运行入口
+├── amap_grid_viewer.py               # 单个专员格高德地图预览
+├── column_config.example.json        # 自定义输入列名模板
 ├── requirements.txt                 # Python 依赖
 ├── README.md                        # 项目概览与快速开始
 └── docs/
@@ -46,9 +50,9 @@ pip install -r requirements.txt
 
 | 输入 | 必需字段 | 说明 |
 |---|---|---|
-| 客户表 | `customer_id`, `city`, `lng`, `lat`, `area_admin_code`, `expected_fyp` | `area_admin_code` 当前实际存放行政街道名称，如“南桥镇” |
-| 行政街道表 | `city`, `area_code`, `area_name`, `area_geometry` | Geometry 支持 GeoJSON、WKT、WKB/EWKB Hex；默认 WGS84 |
-| 已有网格表 | `city`, `agent_net_id`, `basic_net_id`, `basic_net_geom` | 已占用空间，不参与新专员格划分 |
+| 客户表 | `customer_id`, `city`, `lng`, `lat`, `area_admin_code`, `expected_fyp` | 经纬度为 GCJ-02；`area_admin_code` 当前实际存放行政街道名称，如“南桥镇” |
+| 行政街道表 | `city`, `area_code`, `area_name`, `area_geometry` | 每个 `city + area_code` 一行；Geometry 支持 GeoJSON、WKT、WKB/EWKB Hex；坐标为 GCJ-02 |
+| 已有网格表 | `city`, `agent_net_id`, `basic_net_id`, `basic_net_geom` | GCJ-02 已占用空间，不参与新专员格划分 |
 | FYP 门槛表 | `city`, `target_expected_fyp` | 每个城市的最低 FYP |
 | 距离表 | `city`, `distance_km` | 专员格最大跨度/直径，算法自动除以 2 |
 
@@ -81,6 +85,7 @@ result = run_satellite_grid_algorithm(
     cols=ColumnConfig(),
     config=AlgorithmConfig(
         min_customer_count=50,
+        input_coordinate_system="GCJ02",
         build_grid_geometry=True,
     ),
 )
@@ -116,6 +121,44 @@ result.customer_diagnostic
 
 每张表的字段、公式和业务解读见 [输出数据字典](docs/output-data-dictionary.md)。完整运行步骤和问题排查见 [操作指引](docs/operation-guide.md)。
 
+## Terminal 运行与自定义列名
+
+```bash
+python run_satellite_grid.py \
+  --customer data/customers.csv \
+  --admin data/admin_boundaries.csv \
+  --existing-grid data/existing_basic_grids.csv \
+  --fyp-threshold data/city_fyp_threshold.csv \
+  --distance data/city_distance.csv \
+  --column-config column_config.json \
+  --input-coordinate-system GCJ02 \
+  --min-customer-count 50 \
+  --output-dir satellite_grid_output
+```
+
+列名不同时，复制 `column_config.example.json` 为 `column_config.json`，只修改右侧的真实列名。
+
+## 高德地图展示一个专员格
+
+算法输出的 `grid_geometry_geojson_gcj02` 可直接用于高德地图。申请 Web 端 JS API Key 和安全密钥后：
+
+```bash
+export AMAP_JS_API_KEY='你的 Web JS API Key'
+export AMAP_SECURITY_JS_CODE='你的安全密钥'
+
+python amap_grid_viewer.py \
+  --grid-file satellite_grid_output/01_grid_level.csv \
+  --list-grids
+
+python amap_grid_viewer.py \
+  --grid-file satellite_grid_output/01_grid_level.csv \
+  --grid-id '要展示的grid_id'
+
+python -m http.server 8000
+```
+
+浏览器打开 `http://localhost:8000/amap_grid_preview.html`。无需在高德控制台手工上传经纬度；模块会读取所选 Grid 的完整 Polygon/MultiPolygon。
+
 ## 重要数据口径
 
 `H3 映射成功` 不等于 `客户拥有专员格`。正式判断请使用客户大表中的：
@@ -124,10 +167,8 @@ result.customer_diagnostic
 - `grid_assignment_status=ASSIGNED`：同上，适合分类统计。
 - `h3_assigned_to_grid=True` 但 `has_successful_grid=False`：H3 已分配，但该客户本身不符合计入规则。
 
-## 当前待业务确认事项
+## 已确认的数据口径
 
-- 同一行政街道出现多条 Geometry 时，是否代表合法的多个空间片区，或存在数据重复。
-- Geometry 坐标系是否确定为 WGS84 / EPSG:4326，坐标顺序是否为经度、纬度。
-
-程序支持 Polygon/MultiPolygon 和同街道多空间片区，但正式生产运行前仍建议向数据研发确认上述口径。
-
+- 每个 `city + area_code` 只有一行；重复时程序会报错，提示检查取数逻辑。
+- 客户经纬度、行政街道 Geometry 和已有网格 Geometry 均使用 GCJ-02，顺序为 `[经度, 纬度]`。
+- H3 官方使用 WGS84 球面坐标，因此程序内部会统一转换；不要将 GCJ-02 经纬度直接与外部标准 H3 ID 混用。

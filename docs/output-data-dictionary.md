@@ -13,6 +13,8 @@
 | `admin_code`, `admin_name` | 所属行政街道编码和名称 |
 | `seed_h3` | 本格扩张起点 H3 |
 | `seed_lat`, `seed_lng` | 种子 H3 中心点坐标 |
+| `seed_wgs84_lat`, `seed_wgs84_lng` | 明确标注的种子 WGS84 坐标 |
+| `seed_gcj02_lat`, `seed_gcj02_lng` | 高德地图使用的种子 GCJ-02 坐标 |
 | `h3_count` | 最终包含的 H3 数量，不等于客户数 |
 | `grid_fyp` | 本格内所有符合 FYP 口径客户的 `expected_fyp` 汇总 |
 | `target_expected_fyp` | 所在城市的最低 FYP 门槛 |
@@ -25,7 +27,9 @@
 | `distance_diameter_km` | 原业务距离口径，即专员格最大跨度/直径 |
 | `expansion_layers` | 主 BFS 达标时的最大层数；不把后续孤岛吸附作为新主层 |
 | `grid_status` | 成功格固定为 `SUCCESS` |
-| `grid_geometry_geojson` | 可选的最终格 GeoJSON；关闭 Geometry 输出或构建失败时可能为空 |
+| `grid_geometry_geojson` | 向后兼容字段，最终格 WGS84 GeoJSON |
+| `grid_geometry_geojson_wgs84` | 明确标注的 WGS84 Polygon/MultiPolygon，适合标准 GIS/H3 |
+| `grid_geometry_geojson_gcj02` | GCJ-02 Polygon/MultiPolygon，可直接用于高德地图 |
 
 推荐同时观察 `value_utilization` 与 `customer_count_utilization`：前者很高、后者接近 1，说明格子由少量高价值客户驱动；后者很高、前者接近 1，说明需要较多人才能满足 FYP。
 
@@ -86,7 +90,9 @@
 | `h3_id` | H3 ID |
 | `h3_fyp` | H3 价值 |
 | `h3_customer_count` | H3 去重客户数 |
-| `center_lat`, `center_lng` | H3 中心点 |
+| `center_lat`, `center_lng` | 向后兼容的 H3 中心点 WGS84 坐标 |
+| `center_wgs84_lat`, `center_wgs84_lng` | 明确标注的 WGS84 中心点 |
+| `center_gcj02_lat`, `center_gcj02_lng` | 高德地图使用的 GCJ-02 中心点 |
 | `final_status` | 固定为 `ABANDONED` |
 
 废弃不一定是数据错误：它可能是零客户空间、无法在半径内满足双门槛，或无法邻接吸附到已有成功格。
@@ -134,7 +140,9 @@
 |---|---|
 | `city`, `admin_code`, `admin_name` | H3 的行政归属 |
 | `h3_id` | H3 ID |
-| `center_lat`, `center_lng` | H3 中心点 |
+| `center_lat`, `center_lng` | 向后兼容的 H3 中心点 WGS84 坐标 |
+| `center_wgs84_lat`, `center_wgs84_lng` | 明确标注的 WGS84 中心点 |
+| `center_gcj02_lat`, `center_gcj02_lng` | 高德地图使用的 GCJ-02 中心点 |
 | `is_existing_occupied` | 中心点是否落入已有基础网格 |
 | `h3_expected_fyp` | 合法且 FYP 非空客户的价值汇总；无客户为 0 |
 | `h3_customer_count` | 合法非空客户号去重数；可包含 FYP 为空客户 |
@@ -151,6 +159,8 @@
 | `_customer_id_norm` | 标准化后的客户号 |
 | `_customer_id_available` | 客户号是否非空 |
 | `_lng`, `_lat` | 转成数值后的经纬度 |
+| `_input_coordinate_system` | 输入坐标系，当前为 `GCJ02` |
+| `_wgs84_lng`, `_wgs84_lat` | 送入 H3 的 WGS84 客户坐标 |
 | `_fyp` | 转成数值后的 FYP；无法解析时为空 |
 | `_valid_coordinate` | 经纬度是否有效 |
 | `_fyp_available` | FYP 是否可用；0 为可用 |
@@ -177,6 +187,8 @@
 |---|---|
 | `customer_id`, `city` | 客户号和城市 |
 | `customer_lng`, `customer_lat` | 数值化经纬度 |
+| `customer_coordinate_system` | 上述客户坐标的坐标系，当前为 `GCJ02` |
+| `customer_wgs84_lng`, `customer_wgs84_lat` | H3 使用的 WGS84 客户坐标 |
 | `expected_fyp` | 数值化客户 FYP |
 | `customer_admin_name` | 客户表行政街道名称 |
 | `h3_id` | 客户所在 H3 |
@@ -225,4 +237,3 @@
 5. 每个成功格同时满足 FYP、最低客户数、半径和拓扑连通性约束。
 
 校验失败会抛出异常，应先处理问题再使用输出结果。
-

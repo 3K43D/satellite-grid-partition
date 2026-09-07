@@ -25,6 +25,7 @@ inputs/
 output/
 outputs/
 satellite_grid_output/
+amap_grid_preview*.html
 *.csv
 *.xlsx
 *.xls
@@ -38,4 +39,3 @@ satellite_grid_output/
 !.env.example
 *.key
 *.pem
-

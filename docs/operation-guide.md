@@ -27,8 +27,8 @@ Windows PowerShell 激活虚拟环境：
 |---|---|---|
 | `customer_id` | string | 非空才计入客户数；完全重复行自动去重；同一 ID 的冲突记录会报错 |
 | `city` | string | 与其他参数表城市名称一致 |
-| `lng` | number | 经度，范围 `[-180, 180]` |
-| `lat` | number | 纬度，范围 `[-90, 90]` |
+| `lng` | number | GCJ-02 经度，范围 `[-180, 180]` |
+| `lat` | number | GCJ-02 纬度，范围 `[-90, 90]` |
 | `area_admin_code` | string | 当前数据实际为行政街道名称，应与 `area_name` 对齐 |
 | `expected_fyp` | number/null | 0 合法；空值客户仍计人数，但不贡献 FYP |
 
@@ -39,7 +39,7 @@ Windows PowerShell 激活虚拟环境：
 | `city` | 城市名称 |
 | `area_code` | 行政街道唯一编码 |
 | `area_name` | 行政街道名称 |
-| `area_geometry` | GeoJSON、WKT 或 WKB/EWKB Hex；默认 WGS84 |
+| `area_geometry` | GeoJSON、WKT 或 WKB/EWKB Hex；当前为 GCJ-02；每个 `city + area_code` 一行 |
 
 ### 已有网格表
 
@@ -48,7 +48,7 @@ Windows PowerShell 激活虚拟环境：
 | `city` | 城市名称 |
 | `agent_net_id` | 已有专员网格 ID |
 | `basic_net_id` | 已有基础网格 ID |
-| `basic_net_geom` | 已占用区域 Geometry |
+| `basic_net_geom` | GCJ-02 已占用区域 Geometry |
 
 ### 城市参数表
 
@@ -65,6 +65,7 @@ from satellite_grid_partition_v1 import *
 config = AlgorithmConfig(
     h3_resolution=9,
     min_customer_count=50,
+    input_coordinate_system="GCJ02",
     require_customer_admin_match=True,
     build_grid_geometry=True,
 )
@@ -155,7 +156,136 @@ save_result_csv(result, "satellite_grid_output")
 
 CSV 使用 UTF-8-SIG 编码，可直接用 Excel/WPS 打开。所有输出的解释见 `docs/output-data-dictionary.md`。
 
-## 6. 调整参数
+## 6. 在 Terminal 中运行
+
+```bash
+python run_satellite_grid.py \
+  --customer data/customers.csv \
+  --admin data/admin_boundaries.csv \
+  --existing-grid data/existing_basic_grids.csv \
+  --fyp-threshold data/city_fyp_threshold.csv \
+  --distance data/city_distance.csv \
+  --input-coordinate-system GCJ02 \
+  --min-customer-count 50 \
+  --output-dir satellite_grid_output
+```
+
+使用 `python run_satellite_grid.py --help` 查看全部参数。
+
+### 输入列名不一致
+
+复制示例：
+
+```bash
+cp column_config.example.json column_config.json
+```
+
+将 JSON 右侧修改为真实字段名，例如：
+
+```json
+{
+  "customer_id": "客户号",
+  "customer_city": "城市名称",
+  "customer_lng": "客户经度",
+  "customer_lat": "客户纬度",
+  "customer_admin_code": "行政街道名称",
+  "customer_expected_fyp": "预计FYP",
+  "admin_city": "城市名称",
+  "admin_code": "街道编码",
+  "admin_name": "街道名称",
+  "admin_geometry": "街道边界",
+  "existing_city": "城市名称",
+  "existing_agent_grid_id": "专员格ID",
+  "existing_basic_grid_id": "基础格ID",
+  "existing_geometry": "基础格边界",
+  "threshold_city": "城市名称",
+  "threshold_fyp": "最低FYP",
+  "distance_city": "城市名称",
+  "distance_km": "最大跨度KM"
+}
+```
+
+然后增加：
+
+```bash
+--column-config column_config.json
+```
+
+### GCJ-02 与 H3
+
+所有输入空间数据必须使用同一种坐标系。当前配置为 GCJ-02，程序会将客户点、行政街道边界和已有网格边界反算成 WGS84，再调用 H3。输出 Grid 同时提供：
+
+- `grid_geometry_geojson`：兼容字段，WGS84。
+- `grid_geometry_geojson_wgs84`：明确标注的 WGS84。
+- `grid_geometry_geojson_gcj02`：高德地图直接展示用。
+
+GCJ-02 到 WGS84 没有高德官方反向接口，项目采用迭代反算，并通过 WGS84→GCJ-02 正向计算收敛。若以后研发可直接提供 WGS84 数据，应设置 `--input-coordinate-system WGS84`，可避免反算。
+
+## 7. 高德地图展示一个专员格
+
+### 7.1 申请 Key
+
+在高德开放平台创建应用，添加“Web端（JS API）”Key，取得：
+
+- Web JS API Key
+- 安全密钥（securityJsCode）
+
+不要把 Key 或安全密钥写进源码、JSON 配置或提交到 GitHub。
+
+### 7.2 设置当前 Terminal 环境变量
+
+```bash
+export AMAP_JS_API_KEY='你的 Web JS API Key'
+export AMAP_SECURITY_JS_CODE='你的安全密钥'
+```
+
+### 7.3 选择专员格
+
+先列出 ID：
+
+```bash
+python amap_grid_viewer.py \
+  --grid-file satellite_grid_output/01_grid_level.csv \
+  --list-grids
+```
+
+再生成一个专员格的页面：
+
+```bash
+python amap_grid_viewer.py \
+  --grid-file satellite_grid_output/01_grid_level.csv \
+  --grid-id '上海市_310120_G000001' \
+  --output amap_grid_preview.html
+```
+
+这里不需要向高德控制台上传经纬度。脚本会从 `grid_geometry_geojson_gcj02` 读取该专员格的全部 Polygon/MultiPolygon 顶点，并调用高德 JS API 绘制。
+
+### 7.4 打开页面
+
+```bash
+python -m http.server 8000
+```
+
+访问：
+
+```text
+http://localhost:8000/amap_grid_preview.html
+```
+
+如果 Grid 表的列名不同：
+
+```bash
+python amap_grid_viewer.py \
+  --grid-file your_grid.xlsx \
+  --grid-id '目标ID' \
+  --grid-id-column '你的网格ID列' \
+  --geometry-column '你的边界列' \
+  --geometry-coordinate-system GCJ02
+```
+
+生成的 HTML 内含当前 Key 配置，只用于本地预览，不要提交到 Git。
+
+## 8. 调整参数
 
 ```python
 config = AlgorithmConfig(
@@ -167,7 +297,7 @@ config = AlgorithmConfig(
 
 当前最低客户数是全局统一参数。如果以后需要按城市设置不同人数门槛，需要增加一张城市人数参数表或在城市参数表中新增字段。
 
-## 7. 常见问题
+## 9. 常见问题
 
 ### FYP 达标但人数不足
 
@@ -183,7 +313,7 @@ config = AlgorithmConfig(
 
 ### 行政街道生成异常或 H3 数量异常
 
-确认 Geometry 的 CRS 为 EPSG:4326、坐标顺序为 `[longitude, latitude]`，并检查同一 `area_code` 多行是否确为合法的多个空间片区。
+确认输入确为 GCJ-02、坐标顺序为 `[longitude, latitude]`，并检查是否意外出现重复的 `city + area_code`。
 
 ### 运行速度慢或内存占用高
 
@@ -191,4 +321,3 @@ config = AlgorithmConfig(
 - 分城市运行小样本确认数据口径。
 - 避免把明显超出目标城市范围的 Geometry 传入。
 - H3 分辨率越高，单元数量增长越快；不要在未评估数据量时提高分辨率。
-

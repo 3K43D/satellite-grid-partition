@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-城市专员网格自动化划分算法 V1.1
+城市专员网格自动化划分算法 V1.2
 ================================
 
 算法定位
 --------
-本文件实现当前已经锁定的 V1.1 逻辑：
+本文件实现当前已经锁定的 V1.2 逻辑：
 
 1. 使用行政街道 Polygon / MultiPolygon 在地图上生成 H3 Resolution 9 全量空间；
 2. 使用 H3 官方 Cell Center（中心点）判断：
@@ -47,8 +47,9 @@ J. Geometry 当前按最可能的情况处理：
        {"type": "MultiPolygon", "coordinates": ...}
    - 同时兼容 WKT；
    - 同时兼容 WKB / EWKB Hex 字符串。
-K. 默认假设 Geometry 坐标系为 WGS84 / EPSG:4326，坐标顺序为 [longitude, latitude]。
-   程序会做基本经纬度范围检查，但无法自动证明 CRS 一定正确。
+K. 当前业务输入坐标系已确认为 GCJ-02，坐标顺序为 [longitude, latitude]。
+   程序会先将客户点、行政街道和已有网格反算为 WGS84，再调用 H3；
+   最终 Grid 同时输出 WGS84 与高德可直接使用的 GCJ-02 GeoJSON。
 L. 每个成功专员格必须同时满足最低 FYP 与最低去重客户数；
    最低客户数默认为 50，可通过 AlgorithmConfig 调整。
 M. 客户数按非空 customer_id 去重计算；expected_fyp=0 仍计入客户数，
@@ -133,6 +134,7 @@ except ImportError as exc:
 try:
     from shapely import wkb, wkt
     from shapely.geometry import Point, Polygon, MultiPolygon, mapping, shape
+    from shapely.ops import transform as shapely_transform
     from shapely.ops import unary_union
     from shapely.prepared import prep
 except ImportError as exc:
@@ -188,6 +190,11 @@ class AlgorithmConfig:
     """
 
     h3_resolution: int = 9
+
+    # 当前业务输入（客户点、行政街道、已有网格）均为 GCJ-02。
+    # H3 官方使用 WGS84 经纬度，因此算法会先转换为 WGS84 再计算 H3；
+    # 最终 Grid 同时输出 WGS84 与高德可直接展示的 GCJ-02 GeoJSON。
+    input_coordinate_system: str = "GCJ02"
 
     # 每个成功专员格的最低去重客户数，全城市默认使用同一参数。
     min_customer_count: int = 50
@@ -406,18 +413,183 @@ def validate_lonlat_geometry(geom, name: str = "") -> None:
     if not (-180 <= minx <= 180 and -180 <= maxx <= 180):
         raise ValueError(
             f"{name} 的 X 范围不像经度：[{minx}, {maxx}]。"
-            "请确认 CRS 是否为 WGS84/EPSG:4326。"
+            "请确认数据是否为经纬度坐标（WGS84 或 GCJ-02）。"
         )
 
     if not (-90 <= miny <= 90 and -90 <= maxy <= 90):
         raise ValueError(
             f"{name} 的 Y 范围不像纬度：[{miny}, {maxy}]。"
-            "请确认 CRS 是否为 WGS84/EPSG:4326。"
+            "请确认数据是否为经纬度坐标（WGS84 或 GCJ-02）。"
         )
 
 
 # ============================================================
-# 3. H3 兼容层
+# 3. WGS84 / GCJ-02 坐标转换
+# ============================================================
+
+_GCJ_PI = math.pi
+_GCJ_A = 6378245.0
+_GCJ_EE = 0.00669342162296594323
+
+
+def normalize_coordinate_system(value: str) -> str:
+    """将坐标系配置统一为 WGS84 或 GCJ02。"""
+    normalized = str(value).strip().upper().replace("-", "")
+    aliases = {
+        "WGS84": "WGS84",
+        "EPSG:4326": "WGS84",
+        "EPSG4326": "WGS84",
+        "GCJ02": "GCJ02",
+        "AMAP": "GCJ02",
+        "GAODE": "GCJ02",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "input_coordinate_system 仅支持 GCJ02 或 WGS84/EPSG:4326，"
+            f"实际值={value!r}。"
+        )
+    return aliases[normalized]
+
+
+def _outside_gcj02_area(lng: float, lat: float) -> bool:
+    """GCJ-02 加偏移算法的常用中国范围判断。"""
+    return not (72.004 <= lng <= 137.8347 and 0.8293 <= lat <= 55.8271)
+
+
+def _gcj_transform_lat(lng_offset: float, lat_offset: float) -> float:
+    result = (
+        -100.0
+        + 2.0 * lng_offset
+        + 3.0 * lat_offset
+        + 0.2 * lat_offset * lat_offset
+        + 0.1 * lng_offset * lat_offset
+        + 0.2 * math.sqrt(abs(lng_offset))
+    )
+    result += (
+        20.0 * math.sin(6.0 * lng_offset * _GCJ_PI)
+        + 20.0 * math.sin(2.0 * lng_offset * _GCJ_PI)
+    ) * 2.0 / 3.0
+    result += (
+        20.0 * math.sin(lat_offset * _GCJ_PI)
+        + 40.0 * math.sin(lat_offset / 3.0 * _GCJ_PI)
+    ) * 2.0 / 3.0
+    result += (
+        160.0 * math.sin(lat_offset / 12.0 * _GCJ_PI)
+        + 320.0 * math.sin(lat_offset * _GCJ_PI / 30.0)
+    ) * 2.0 / 3.0
+    return result
+
+
+def _gcj_transform_lng(lng_offset: float, lat_offset: float) -> float:
+    result = (
+        300.0
+        + lng_offset
+        + 2.0 * lat_offset
+        + 0.1 * lng_offset * lng_offset
+        + 0.1 * lng_offset * lat_offset
+        + 0.1 * math.sqrt(abs(lng_offset))
+    )
+    result += (
+        20.0 * math.sin(6.0 * lng_offset * _GCJ_PI)
+        + 20.0 * math.sin(2.0 * lng_offset * _GCJ_PI)
+    ) * 2.0 / 3.0
+    result += (
+        20.0 * math.sin(lng_offset * _GCJ_PI)
+        + 40.0 * math.sin(lng_offset / 3.0 * _GCJ_PI)
+    ) * 2.0 / 3.0
+    result += (
+        150.0 * math.sin(lng_offset / 12.0 * _GCJ_PI)
+        + 300.0 * math.sin(lng_offset / 30.0 * _GCJ_PI)
+    ) * 2.0 / 3.0
+    return result
+
+
+def wgs84_to_gcj02(lng: float, lat: float) -> Tuple[float, float]:
+    """WGS84 -> GCJ-02。中国范围外保持不变。"""
+    lng = float(lng)
+    lat = float(lat)
+    if _outside_gcj02_area(lng, lat):
+        return lng, lat
+
+    dlat = _gcj_transform_lat(lng - 105.0, lat - 35.0)
+    dlng = _gcj_transform_lng(lng - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * _GCJ_PI
+    magic = math.sin(radlat)
+    magic = 1.0 - _GCJ_EE * magic * magic
+    sqrt_magic = math.sqrt(magic)
+    dlat = (
+        dlat * 180.0
+        / ((_GCJ_A * (1.0 - _GCJ_EE)) / (magic * sqrt_magic) * _GCJ_PI)
+    )
+    dlng = (
+        dlng * 180.0
+        / (_GCJ_A / sqrt_magic * math.cos(radlat) * _GCJ_PI)
+    )
+    return lng + dlng, lat + dlat
+
+
+def gcj02_to_wgs84(
+    lng: float,
+    lat: float,
+    tolerance: float = 1e-7,
+    max_iterations: int = 10,
+) -> Tuple[float, float]:
+    """
+    GCJ-02 -> WGS84 的迭代反算。
+
+    高德官方只提供其他坐标转高德坐标，没有官方 GCJ-02 反算接口；
+    本函数用于让 H3 在其要求的 WGS84 坐标上工作，并通过正向转换迭代收敛。
+    """
+    lng = float(lng)
+    lat = float(lat)
+    if _outside_gcj02_area(lng, lat):
+        return lng, lat
+
+    wgs_lng = lng
+    wgs_lat = lat
+    for _ in range(max_iterations):
+        converted_lng, converted_lat = wgs84_to_gcj02(wgs_lng, wgs_lat)
+        delta_lng = lng - converted_lng
+        delta_lat = lat - converted_lat
+        wgs_lng += delta_lng
+        wgs_lat += delta_lat
+        if abs(delta_lng) <= tolerance and abs(delta_lat) <= tolerance:
+            break
+    return wgs_lng, wgs_lat
+
+
+def _transform_geometry_coordinates(geom, converter):
+    """对 Shapely Geometry 的每个顶点执行坐标转换。"""
+    def transform_xy(x, y, z=None):
+        try:
+            converted = [converter(float(lng), float(lat)) for lng, lat in zip(x, y)]
+            new_x = [item[0] for item in converted]
+            new_y = [item[1] for item in converted]
+            return (new_x, new_y) if z is None else (new_x, new_y, z)
+        except TypeError:
+            new_x, new_y = converter(float(x), float(y))
+            return (new_x, new_y) if z is None else (new_x, new_y, z)
+
+    return shapely_transform(transform_xy, geom)
+
+
+def geometry_to_wgs84(geom, source_coordinate_system: str):
+    """将输入 Geometry 转为 H3 使用的 WGS84。"""
+    source = normalize_coordinate_system(source_coordinate_system)
+    if geom is None or geom.is_empty or source == "WGS84":
+        return geom
+    return _transform_geometry_coordinates(geom, gcj02_to_wgs84)
+
+
+def geometry_to_gcj02(geom):
+    """将 WGS84 Geometry 转为高德地图使用的 GCJ-02。"""
+    if geom is None or geom.is_empty:
+        return geom
+    return _transform_geometry_coordinates(geom, wgs84_to_gcj02)
+
+
+# ============================================================
+# 4. H3 兼容层
 # ============================================================
 
 def h3_latlng_to_cell(lat: float, lng: float, resolution: int) -> str:
@@ -576,7 +748,7 @@ def h3_cell_boundary_polygon(cell: str) -> Polygon:
 
 
 # ============================================================
-# 4. 距离
+# 5. 距离
 # ============================================================
 
 def haversine_distance_m(
@@ -615,13 +787,15 @@ def haversine_distance_m(
 def prepare_admin_boundaries(
     admin_df: pd.DataFrame,
     cols: ColumnConfig,
+    config: Optional[AlgorithmConfig] = None,
 ) -> pd.DataFrame:
     """
     解析行政街道 Polygon / MultiPolygon。
 
-    如果同一 city + area_code 出现多行，
-    自动 unary_union 成一个 Geometry。
+    当前数据契约要求每个 city + area_code 恰好一行。
+    输入 Geometry 按配置从 GCJ-02 转为 H3 使用的 WGS84。
     """
+    config = config or AlgorithmConfig()
     _require_columns(
         admin_df,
         [
@@ -645,6 +819,21 @@ def prepare_admin_boundaries(
     work[cols.admin_city] = _normalize_city_series(work[cols.admin_city])
     work[cols.admin_code] = work[cols.admin_code].map(_normalize_code)
 
+    duplicated = work.duplicated(
+        [cols.admin_city, cols.admin_code],
+        keep=False,
+    )
+    if duplicated.any():
+        examples = work.loc[
+            duplicated,
+            [cols.admin_city, cols.admin_code, cols.admin_name],
+        ].head(20)
+        raise ValueError(
+            "行政街道表要求每个 city + area_code 只有一行，"
+            "但检测到重复记录。请检查取数逻辑。\n"
+            f"示例：\n{examples}"
+        )
+
     parsed = []
     for idx, value in work[cols.admin_geometry].items():
         try:
@@ -652,6 +841,10 @@ def prepare_admin_boundaries(
             validate_lonlat_geometry(
                 geom,
                 name=f"行政街道表 row={idx}",
+            )
+            geom = geometry_to_wgs84(
+                geom,
+                config.input_coordinate_system,
             )
             parsed.append(geom)
         except Exception as exc:
@@ -702,6 +895,7 @@ def prepare_admin_boundaries(
 def prepare_existing_occupied_area(
     existing_grid_df: pd.DataFrame,
     cols: ColumnConfig,
+    config: Optional[AlgorithmConfig] = None,
 ) -> Dict[str, Any]:
     """
     按城市将所有已有基础网格 Geometry 做 Union。
@@ -709,6 +903,8 @@ def prepare_existing_occupied_area(
     算法并不关心已有基础网格属于哪个专员格；
     只关心“哪些空间已经被占用”。
     """
+    config = config or AlgorithmConfig()
+
     _require_columns(
         existing_grid_df,
         [
@@ -736,6 +932,10 @@ def prepare_existing_occupied_area(
             validate_lonlat_geometry(
                 geom,
                 name=f"已有基础网格表 row={idx}",
+            )
+            geom = geometry_to_wgs84(
+                geom,
+                config.input_coordinate_system,
             )
             parsed.append(geom)
         except Exception as exc:
@@ -931,6 +1131,7 @@ def build_admin_h3_pool(
         for cell in sorted(candidate_cells):
             lat, lng = h3_cell_to_latlng(cell)
             point = Point(lng, lat)
+            gcj_lng, gcj_lat = wgs84_to_gcj02(lng, lat)
 
             # 再次显式执行中心点归属，锁死业务口径
             if not prepared_admin.covers(point):
@@ -978,6 +1179,10 @@ def build_admin_h3_pool(
                     "h3_id": cell,
                     "center_lat": lat,
                     "center_lng": lng,
+                    "center_wgs84_lat": lat,
+                    "center_wgs84_lng": lng,
+                    "center_gcj02_lat": gcj_lat,
+                    "center_gcj02_lng": gcj_lng,
                     "is_existing_occupied": occupied,
                 }
             )
@@ -1129,6 +1334,26 @@ def prepare_customers_and_attach_fyp(
         & cust["_lat"].between(-90, 90)
     )
 
+    source_coordinate_system = normalize_coordinate_system(
+        config.input_coordinate_system
+    )
+    wgs84_coordinates: List[Tuple[float, float]] = []
+    for _, row in cust.iterrows():
+        if not bool(row["_valid_coordinate"]):
+            wgs84_coordinates.append((np.nan, np.nan))
+        elif source_coordinate_system == "GCJ02":
+            wgs84_coordinates.append(
+                gcj02_to_wgs84(row["_lng"], row["_lat"])
+            )
+        else:
+            wgs84_coordinates.append(
+                (float(row["_lng"]), float(row["_lat"]))
+            )
+
+    cust["_wgs84_lng"] = [item[0] for item in wgs84_coordinates]
+    cust["_wgs84_lat"] = [item[1] for item in wgs84_coordinates]
+    cust["_input_coordinate_system"] = source_coordinate_system
+
     cust["_fyp_available"] = cust["_fyp"].notna()
 
     if not config.allow_negative_fyp:
@@ -1157,8 +1382,8 @@ def prepare_customers_and_attach_fyp(
         try:
             h3_ids.append(
                 h3_latlng_to_cell(
-                    row["_lat"],
-                    row["_lng"],
+                    row["_wgs84_lat"],
+                    row["_wgs84_lng"],
                     config.h3_resolution,
                 )
             )
@@ -1760,6 +1985,10 @@ def _build_one_admin(
     for grid_id in sorted(grids):
         grid = grids[grid_id]
         cells = sorted(grid["h3_set"])
+        seed_gcj_lng, seed_gcj_lat = wgs84_to_gcj02(
+            grid["seed_lng"],
+            grid["seed_lat"],
+        )
 
         max_dist = 0.0
         for cell in cells:
@@ -1781,6 +2010,10 @@ def _build_one_admin(
             "seed_h3": grid["seed_h3"],
             "seed_lat": float(grid["seed_lat"]),
             "seed_lng": float(grid["seed_lng"]),
+            "seed_wgs84_lat": float(grid["seed_lat"]),
+            "seed_wgs84_lng": float(grid["seed_lng"]),
+            "seed_gcj02_lat": float(seed_gcj_lat),
+            "seed_gcj02_lng": float(seed_gcj_lng),
             "h3_count": int(len(cells)),
             "grid_fyp": float(grid["grid_fyp"]),
             "target_expected_fyp": float(target_fyp),
@@ -1818,11 +2051,21 @@ def _build_one_admin(
                     mapping(grid_geom),
                     ensure_ascii=False,
                 )
+                row["grid_geometry_geojson_wgs84"] = row[
+                    "grid_geometry_geojson"
+                ]
+                grid_geom_gcj02 = geometry_to_gcj02(grid_geom)
+                row["grid_geometry_geojson_gcj02"] = json.dumps(
+                    mapping(grid_geom_gcj02),
+                    ensure_ascii=False,
+                )
             except Exception as exc:
                 warnings.warn(
                     f"grid_id={grid_id} Geometry 输出失败：{exc}"
                 )
                 row["grid_geometry_geojson"] = None
+                row["grid_geometry_geojson_wgs84"] = None
+                row["grid_geometry_geojson_gcj02"] = None
 
         grid_rows.append(row)
 
@@ -1834,6 +2077,7 @@ def _build_one_admin(
     abandoned_rows: List[Dict[str, Any]] = []
     for cell in sorted(island_pool):
         lat, lng = centers[cell]
+        gcj_lng, gcj_lat = wgs84_to_gcj02(lng, lat)
         abandoned_rows.append(
             {
                 "city": city,
@@ -1846,6 +2090,10 @@ def _build_one_admin(
                 ),
                 "center_lat": float(lat),
                 "center_lng": float(lng),
+                "center_wgs84_lat": float(lat),
+                "center_wgs84_lng": float(lng),
+                "center_gcj02_lat": float(gcj_lat),
+                "center_gcj02_lng": float(gcj_lng),
                 "final_status": "ABANDONED",
             }
         )
@@ -2093,6 +2341,11 @@ def build_grid_customer_detail(
     detail["city"] = detail[cols.customer_city]
     detail["customer_lng"] = detail["_lng"]
     detail["customer_lat"] = detail["_lat"]
+    detail["customer_coordinate_system"] = detail[
+        "_input_coordinate_system"
+    ]
+    detail["customer_wgs84_lng"] = detail["_wgs84_lng"]
+    detail["customer_wgs84_lat"] = detail["_wgs84_lat"]
     detail["expected_fyp"] = detail["_fyp"]
     detail["h3_id"] = detail["_h3_id"]
 
@@ -2136,6 +2389,9 @@ def build_grid_customer_detail(
         "city",
         "customer_lng",
         "customer_lat",
+        "customer_coordinate_system",
+        "customer_wgs84_lng",
+        "customer_wgs84_lat",
         "expected_fyp",
         "customer_admin_name",
         "h3_id",
@@ -2168,6 +2424,9 @@ def build_grid_customer_detail(
         "grid_status",
         "_customer_id_available",
         "_valid_coordinate",
+        "_input_coordinate_system",
+        "_wgs84_lng",
+        "_wgs84_lat",
         "_fyp_available",
         "_h3_in_admin_geometry",
         "_admin_consistent",
@@ -2655,6 +2914,9 @@ def run_satellite_grid_algorithm(
     ):
         raise ValueError("min_customer_count 必须是正整数。")
 
+    # 提前校验坐标系配置。当前 H3 内部统一使用 WGS84。
+    normalize_coordinate_system(config.input_coordinate_system)
+
     # 1. 城市参数
     city_params = prepare_city_parameters(
         fyp_threshold_df,
@@ -2666,12 +2928,14 @@ def run_satellite_grid_algorithm(
     admin_boundaries = prepare_admin_boundaries(
         admin_df,
         cols,
+        config,
     )
 
     # 3. 已有基础网格 Union
     occupied_by_city = prepare_existing_occupied_area(
         existing_grid_df,
         cols,
+        config,
     )
 
     # 4. 行政街道铺满 H3 + 已有区域排除
