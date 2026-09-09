@@ -29,7 +29,7 @@ Windows PowerShell 激活虚拟环境：
 | `city` | string | 与其他参数表城市名称一致 |
 | `lng` | number | GCJ-02 经度，范围 `[-180, 180]` |
 | `lat` | number | GCJ-02 纬度，范围 `[-90, 90]` |
-| `area_admin_code` | string | 当前数据实际为行政街道名称，应与 `area_name` 对齐 |
+| `area_admin_code` | string | 当前数据实际为行政街道名称；开启街道限制时应与 `area_name` 对齐，关闭时可不提供 |
 | `expected_fyp` | number/null | 0 合法；空值客户仍计人数，但不贡献 FYP |
 
 ### 行政街道表
@@ -40,6 +40,8 @@ Windows PowerShell 激活虚拟环境：
 | `area_code` | 行政街道唯一编码 |
 | `area_name` | 行政街道名称 |
 | `area_geometry` | GeoJSON、WKT 或 WKB/EWKB Hex；当前为 GCJ-02；每个 `city + area_code` 一行 |
+
+即使关闭行政街道限制，行政街道表仍需输入：算法会使用同一城市所有街道 Geometry 的整体覆盖范围构造城市 H3 空间，但不会再把街道边界作为 BFS 隔离线。
 
 ### 已有网格表
 
@@ -66,6 +68,7 @@ config = AlgorithmConfig(
     h3_resolution=9,
     min_customer_count=50,
     input_coordinate_system="GCJ02",
+    restrict_to_admin_street=True,
     require_customer_admin_match=True,
     build_grid_geometry=True,
 )
@@ -291,11 +294,34 @@ python amap_grid_viewer.py \
 config = AlgorithmConfig(
     min_customer_count=60,       # 所有城市统一最低人数
     h3_resolution=9,
+    restrict_to_admin_street=True,
     build_grid_geometry=False,   # 大数据调试时关闭几何输出以提速
 )
 ```
 
 当前最低客户数是全局统一参数。如果以后需要按城市设置不同人数门槛，需要增加一张城市人数参数表或在城市参数表中新增字段。
+
+### 是否限制在同一行政街道
+
+保持原逻辑、禁止跨行政街道：
+
+```python
+config = AlgorithmConfig(
+    restrict_to_admin_street=True,
+)
+```
+
+允许同一城市内跨行政街道：
+
+```python
+config = AlgorithmConfig(
+    restrict_to_admin_street=False,
+)
+```
+
+关闭限制后，算法按城市建立统一邻接池，客户街道名称不再影响人数和 FYP 资格。已有基础网格占用区仍然排除，网格仍然不能跨城市，距离、最低客户数和 FYP 门槛均保持不变。城市级网格的行政字段标记为 `CITY_WIDE` 和 `城市内跨行政街道`。
+
+`require_customer_admin_match` 只在 `restrict_to_admin_street=True` 时生效。
 
 ## 9. 常见问题
 

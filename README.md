@@ -9,7 +9,7 @@
 - H3 分辨率默认为 9。
 - 当前客户点、行政街道和已有网格输入坐标系为 GCJ-02；算法先转换为 WGS84 再调用 H3。
 - H3 行政归属和既有网格占用均按 **H3 中心点落入 Polygon** 判断。
-- 每个“城市 × 行政街道”独立划分，不跨行政街道生长。
+- 默认每个“城市 × 行政街道”独立划分；可关闭行政街道限制，改为同一城市内允许跨街道生长。
 - 城市距离参数按专员格最大跨度（直径）解释，算法半径为 `distance_km / 2`。
 - 种子按“自身 FYP + 未分配一阶邻居 FYP”选择。
 - BFS 同层依次按 FYP 降序、距种子距离升序、H3 ID 升序吸收。
@@ -51,7 +51,7 @@ pip install -r requirements.txt
 
 | 输入 | 必需字段 | 说明 |
 |---|---|---|
-| 客户表 | `customer_id`, `city`, `lng`, `lat`, `area_admin_code`, `expected_fyp` | 经纬度为 GCJ-02；`area_admin_code` 当前实际存放行政街道名称，如“南桥镇” |
+| 客户表 | `customer_id`, `city`, `lng`, `lat`, `area_admin_code`, `expected_fyp` | 经纬度为 GCJ-02；`area_admin_code` 当前实际存放行政街道名称，如“南桥镇”；关闭街道限制时该字段可不提供 |
 | 行政街道表 | `city`, `area_code`, `area_name`, `area_geometry` | 每个 `city + area_code` 一行；Geometry 支持 GeoJSON、WKT、WKB/EWKB Hex；坐标为 GCJ-02 |
 | 已有网格表 | `city`, `agent_net_id`, `basic_net_id`, `basic_net_geom` | GCJ-02 已占用空间，不参与新专员格划分 |
 | FYP 门槛表 | `city`, `target_expected_fyp` | 每个城市的最低 FYP |
@@ -87,12 +87,26 @@ result = run_satellite_grid_algorithm(
     config=AlgorithmConfig(
         min_customer_count=50,
         input_coordinate_system="GCJ02",
+        restrict_to_admin_street=True,
         build_grid_geometry=True,
     ),
 )
 
 save_result_csv(result, "satellite_grid_output")
 ```
+
+需要允许同一城市内跨行政街道时，只改这一项：
+
+```python
+config = AlgorithmConfig(
+    min_customer_count=50,
+    input_coordinate_system="GCJ02",
+    restrict_to_admin_street=False,
+    build_grid_geometry=True,
+)
+```
+
+此时城市内所有行政街道的合法 H3 在同一个池中参与 BFS，客户街道名称不再作为排除条件；已有基础网格、城市边界、距离、最低 50 人和 FYP 门槛继续生效。输出网格的 `admin_code`、`admin_name` 分别标记为 `CITY_WIDE`、`城市内跨行政街道`。
 
 运行后可直接访问：
 
@@ -106,6 +120,8 @@ result.coverage_metrics
 result.h3_pool
 result.customer_diagnostic
 ```
+
+`result.grids` 同时输出专员格几何质心和内部代表点的 WGS84、GCJ-02 经纬度。几何质心适合分析，但可能落在凹形或 MultiPolygon 外；高德地图标注建议使用 `grid_label_point_gcj02_lng`、`grid_label_point_gcj02_lat`。
 
 ## 输出文件
 
@@ -134,8 +150,11 @@ python run_satellite_grid.py \
   --column-config column_config.json \
   --input-coordinate-system GCJ02 \
   --min-customer-count 50 \
+  --allow-cross-admin-street \
   --output-dir satellite_grid_output
 ```
+
+不传 `--allow-cross-admin-street` 时保持原有的不可跨街道逻辑。
 
 列名不同时，复制 `column_config.example.json` 为 `column_config.json`，只修改右侧的真实列名。
 

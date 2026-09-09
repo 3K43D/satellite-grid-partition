@@ -74,6 +74,14 @@ def parse_args() -> argparse.Namespace:
         help="不要求客户街道名称与 Geometry 判定街道一致",
     )
     parser.add_argument(
+        "--allow-cross-admin-street",
+        action="store_true",
+        help=(
+            "关闭行政街道硬边界：专员格可在同一城市内跨街道，"
+            "已有基础网格仍然排除"
+        ),
+    )
+    parser.add_argument(
         "--allow-negative-fyp",
         action="store_true",
         help="允许负 expected_fyp；正常业务不建议开启",
@@ -113,6 +121,9 @@ def main() -> None:
         h3_resolution=args.h3_resolution,
         min_customer_count=args.min_customer_count,
         input_coordinate_system=args.input_coordinate_system,
+        restrict_to_admin_street=(
+            not args.allow_cross_admin_street
+        ),
         require_customer_admin_match=(
             not args.skip_customer_admin_match
         ),
@@ -146,4 +157,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

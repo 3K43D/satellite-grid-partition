@@ -10,7 +10,8 @@
 |---|---|
 | `grid_id` | 专员格唯一 ID |
 | `city` | 所属城市 |
-| `admin_code`, `admin_name` | 所属行政街道编码和名称 |
+| `admin_code`, `admin_name` | 开启街道限制时为所属行政街道；关闭时固定为 `CITY_WIDE`、`城市内跨行政街道` |
+| `admin_restriction_enabled` | 本次运行是否启用行政街道硬边界 |
 | `seed_h3` | 本格扩张起点 H3 |
 | `seed_lat`, `seed_lng` | 种子 H3 中心点坐标 |
 | `seed_wgs84_lat`, `seed_wgs84_lng` | 明确标注的种子 WGS84 坐标 |
@@ -30,8 +31,14 @@
 | `grid_geometry_geojson` | 向后兼容字段，最终格 WGS84 GeoJSON |
 | `grid_geometry_geojson_wgs84` | 明确标注的 WGS84 Polygon/MultiPolygon，适合标准 GIS/H3 |
 | `grid_geometry_geojson_gcj02` | GCJ-02 Polygon/MultiPolygon，可直接用于高德地图 |
+| `grid_centroid_wgs84_lng`, `grid_centroid_wgs84_lat` | 合并后专员格 Geometry 的 WGS84 几何质心；凹形或 MultiPolygon 时可能落在地块外 |
+| `grid_centroid_gcj02_lng`, `grid_centroid_gcj02_lat` | 上述几何质心转换后的 GCJ-02 坐标 |
+| `grid_label_point_wgs84_lng`, `grid_label_point_wgs84_lat` | 保证位于 WGS84 专员格 Geometry 内的代表点 |
+| `grid_label_point_gcj02_lng`, `grid_label_point_gcj02_lat` | 保证位于 GCJ-02 专员格 Geometry 内的代表点，推荐用于高德标签或气泡 |
 
 推荐同时观察 `value_utilization` 与 `customer_count_utilization`：前者很高、后者接近 1，说明格子由少量高价值客户驱动；后者很高、前者接近 1，说明需要较多人才能满足 FYP。
+
+当 `build_grid_geometry=False` 时，边界、几何质心和内部代表点字段保留但值为空。
 
 ## 2. `h3_detail` / `02_h3_detail.csv`
 
@@ -40,7 +47,8 @@
 | 字段 | 含义与解读 |
 |---|---|
 | `grid_id` | 最终所属专员格 |
-| `city`, `admin_code`, `admin_name` | 城市和行政街道 |
+| `city`, `admin_code`, `admin_name` | 城市和划分范围；关闭街道限制时行政字段为城市级标记，不代表单一街道 |
+| `admin_restriction_enabled` | 是否启用行政街道硬边界 |
 | `h3_id` | H3 单元 ID |
 | `h3_fyp` | 该 H3 内符合 FYP 口径的价值汇总 |
 | `h3_customer_count` | 该 H3 内符合人数口径的去重客户数 |
@@ -58,6 +66,7 @@
 | 字段 | 含义与解读 |
 |---|---|
 | `city`, `admin_code`, `admin_name` | 尝试所在区域 |
+| `admin_restriction_enabled` | 是否启用行政街道硬边界 |
 | `seed_h3` | 失败尝试的种子 |
 | `seed_fyp`, `seed_customer_count` | 种子自身价值和客户数 |
 | `seed_gravity_score` | 种子自身及未分配一阶邻居 FYP 之和 |
@@ -87,6 +96,7 @@
 | 字段 | 含义与解读 |
 |---|---|
 | `city`, `admin_code`, `admin_name` | 所属区域 |
+| `admin_restriction_enabled` | 是否启用行政街道硬边界 |
 | `h3_id` | H3 ID |
 | `h3_fyp` | H3 价值 |
 | `h3_customer_count` | H3 去重客户数 |
@@ -103,6 +113,7 @@
 
 | 字段 | 公式或含义 |
 |---|---|
+| `admin_restriction_enabled` | 本次运行是否启用行政街道硬边界 |
 | `target_customer_count` | 非空客户号数量；客户号已全局去重 |
 | `missing_customer_id_record_count` | 客户号为空的记录数，不进入人数分母 |
 | `valid_coordinate_count` | 非空客户号中经纬度有效的数量 |
@@ -115,7 +126,7 @@
 | `customer_admin_consistent_rate` | 上述数量 / 目标客户数 |
 | `existing_grid_excluded_count` | 落入已有基础网格而被排除的客户数 |
 | `existing_grid_excluded_rate` | 上述数量 / 目标客户数 |
-| `legal_candidate_customer_count` | 满足客户号、坐标、行政边界、既有网格和街道一致性规则的客户数 |
+| `legal_candidate_customer_count` | 满足客户号、坐标、城市空间和既有网格规则的客户数；仅在开启街道限制时要求街道一致 |
 | `legal_candidate_customer_rate` | 合法候选客户数 / 目标客户数 |
 | `final_satellite_grid_customer_count` | 最终进入成功卫星专员格的合法客户数 |
 | `overall_customer_coverage_rate` | 最终分配客户数 / 全部目标客户数 |
@@ -139,6 +150,7 @@
 | 字段 | 含义与解读 |
 |---|---|
 | `city`, `admin_code`, `admin_name` | H3 的行政归属 |
+| `admin_restriction_enabled` | 本次运行是否启用行政街道硬边界；关闭时行政归属只用于空间来源和诊断 |
 | `h3_id` | H3 ID |
 | `center_lat`, `center_lng` | 向后兼容的 H3 中心点 WGS84 坐标 |
 | `center_wgs84_lat`, `center_wgs84_lng` | 明确标注的 WGS84 中心点 |
@@ -160,6 +172,7 @@
 | `_customer_id_available` | 客户号是否非空 |
 | `_lng`, `_lat` | 转成数值后的经纬度 |
 | `_input_coordinate_system` | 输入坐标系，当前为 `GCJ02` |
+| `_admin_restriction_enabled` | 本次运行是否启用行政街道硬边界 |
 | `_wgs84_lng`, `_wgs84_lat` | 送入 H3 的 WGS84 客户坐标 |
 | `_fyp` | 转成数值后的 FYP；无法解析时为空 |
 | `_valid_coordinate` | 经纬度是否有效 |
@@ -199,7 +212,8 @@
 | 字段 | 含义 |
 |---|---|
 | `grid_id` | 最终所属专员格；没有成功格时为空 |
-| `grid_admin_code`, `grid_admin_name` | 网格所属行政街道 |
+| `grid_admin_code`, `grid_admin_name` | 网格划分范围；关闭街道限制时为 `CITY_WIDE`、`城市内跨行政街道`，客户自身街道仍看 `customer_admin_name` |
+| `admin_restriction_enabled` | 本次运行是否启用行政街道硬边界 |
 | `h3_assigned_to_grid` | 客户所在 H3 是否进入成功网格，仅为空间判断 |
 | `has_successful_grid` | H3 已成功分格且客户符合人数资格；正式业务判断字段 |
 | `counts_toward_grid_customer_minimum` | 该客户是否计入所属格最低人数，目前等同 `has_successful_grid` |
@@ -218,6 +232,10 @@
 | `assigned_h3_fyp`, `assigned_h3_customer_count` | 客户所在已分配 H3 的价值和去重客户数 |
 | `grid_seed_h3`, `distance_to_grid_seed_m` | 所属格种子及距离 |
 | `h3_assignment_method`, `h3_assignment_layer` | H3 如何进入该格及 BFS 层级 |
+| `grid_centroid_wgs84_lng`, `grid_centroid_wgs84_lat` | 所属专员格的 WGS84 几何质心 |
+| `grid_centroid_gcj02_lng`, `grid_centroid_gcj02_lat` | 所属专员格的 GCJ-02 几何质心 |
+| `grid_label_point_wgs84_lng`, `grid_label_point_wgs84_lat` | 所属专员格的 WGS84 内部代表点 |
+| `grid_label_point_gcj02_lng`, `grid_label_point_gcj02_lat` | 所属专员格的 GCJ-02 内部代表点，推荐用于高德展示 |
 | `h3_count` | 所属格 H3 数量 |
 | `grid_fyp`, `target_expected_fyp`, `value_utilization` | 所属格价值、门槛和达成倍数 |
 | `grid_customer_count`, `min_customer_count`, `customer_count_utilization` | 所属格客户数、人数门槛和达成倍数 |

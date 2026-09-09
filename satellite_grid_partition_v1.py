@@ -33,7 +33,8 @@ D. 城市距离字段单位为 KM，业务含义为“一个专员格的最大�
    因此算法实际 Seed 最大覆盖半径 = distance_km * 1000 / 2。
 E. 行政街道 Polygon / MultiPolygon 不要求连续；
    MultiPolygon 会作为同一个行政街道的多个空间部分处理。
-F. 不允许跨行政街道生长。
+F. 默认不允许跨行政街道生长；可通过 AlgorithmConfig 中的开关改为
+   仅限制在同一城市内、允许跨行政街道生长。
 G. 无客户 H3 必须保留，FYP = 0。
 H. 引力分数只用于选 Seed：
       gravity = 自身 H3 FYP + 当前未分配池内一阶合法邻居 H3 FYP
@@ -84,6 +85,7 @@ from satellite_grid_partition_v1 import (
 
 config = AlgorithmConfig(
     min_customer_count=50,
+    restrict_to_admin_street=True,
 )
 
 result = run_satellite_grid_algorithm(
@@ -203,7 +205,7 @@ class AlgorithmConfig:
     earth_radius_m: float = 6_371_008.8
 
     # 是否要求客户表中的行政街道名称与 H3 Center 判定出的行政街道一致。
-    # 建议保持 True，防止行政边界附近客户被错误跨街道计入。
+    # 仅在 restrict_to_admin_street=True 时生效；关闭街道硬边界时自动忽略。
     require_customer_admin_match: bool = True
 
     # expected_fyp 是否允许负数。正常业务下应为 False。
@@ -224,6 +226,13 @@ class AlgorithmConfig:
 
     # 数值比较容差
     epsilon: float = 1e-9
+
+    # 是否将行政街道作为专员格的硬边界：
+    # True  = 保持原逻辑，每个“城市 × 行政街道”独立划分；
+    # False = 仅按城市划分，专员格可以跨行政街道。
+    # 无论取值如何，已有基础网格占用区都继续排除。
+    # 放在配置末尾以保持原有位置参数顺序兼容。
+    restrict_to_admin_street: bool = True
 
 
 @dataclass
@@ -1282,7 +1291,10 @@ def build_admin_h3_pool(
                 previous_code, previous_name = owner_map[key]
 
                 if previous_code != admin_code:
-                    if not config.allow_admin_overlap_tiebreak:
+                    if (
+                        config.restrict_to_admin_street
+                        and not config.allow_admin_overlap_tiebreak
+                    ):
                         raise ValueError(
                             "检测到同一 H3 Center 同时落入多个行政街道。\n"
                             f"city={city}, h3={cell}, "
@@ -1293,7 +1305,9 @@ def build_admin_h3_pool(
                             "allow_admin_overlap_tiebreak=True。"
                         )
 
-                    # deterministic tie-break：保留较小 admin_code
+                    # 关闭行政街道限制时，街道仅用于构造城市空间和诊断，
+                    # 同一城市的重复 H3 不应阻断算法；确定性保留较小编码。
+                    # 开启限制且明确允许重叠时，也采用同一规则。
                     if admin_code >= previous_code:
                         continue
 
@@ -1323,6 +1337,9 @@ def build_admin_h3_pool(
                     "center_gcj02_lat": gcj_lat,
                     "center_gcj02_lng": gcj_lng,
                     "is_existing_occupied": occupied,
+                    "admin_restriction_enabled": bool(
+                        config.restrict_to_admin_street
+                    ),
                 }
             )
 
@@ -1359,9 +1376,11 @@ def prepare_customers_and_attach_fyp(
     - H3 的行政归属来自行政街道 Geometry；
     - 客户表 customer_admin_code 配置当前指向中文行政街道名称，
       只作为一致性校验；
-    - 默认 require_customer_admin_match=True：
+    - 默认 restrict_to_admin_street=True 且 require_customer_admin_match=True：
       客户行政街道名称与 H3 Center 所属行政街道名称不一致时，
       不将该客户 FYP 计入网格算法，并在诊断表中标记。
+    - restrict_to_admin_street=False 时，街道名称仅保留用于诊断，
+      不再影响客户人数和 FYP 资格。
     """
 
     required = [
@@ -1374,7 +1393,10 @@ def prepare_customers_and_attach_fyp(
 
     # 客户行政街道是强烈建议字段。
     # 如果配置要求行政一致性，则必须存在。
-    if config.require_customer_admin_match:
+    if (
+        config.restrict_to_admin_street
+        and config.require_customer_admin_match
+    ):
         required.append(cols.customer_admin_code)
 
     _require_columns(customer_df, required, "客户表")
@@ -1496,6 +1518,9 @@ def prepare_customers_and_attach_fyp(
     cust["_wgs84_lng"] = wgs84_lng
     cust["_wgs84_lat"] = wgs84_lat
     cust["_input_coordinate_system"] = source_coordinate_system
+    cust["_admin_restriction_enabled"] = bool(
+        config.restrict_to_admin_street
+    )
 
     cust["_fyp_available"] = cust["_fyp"].notna()
 
@@ -1595,7 +1620,10 @@ def prepare_customers_and_attach_fyp(
         & (~cust["_excluded_by_existing_grid"])
     )
 
-    if config.require_customer_admin_match:
+    if (
+        config.restrict_to_admin_street
+        and config.require_customer_admin_match
+    ):
         cust["_legal_customer_for_count"] &= cust[
             "_admin_consistent"
         ]
@@ -1672,7 +1700,7 @@ def prepare_customers_and_attach_fyp(
 
 
 # ============================================================
-# 8. 单个行政街道 BFS 算法
+# 8. 单个划分范围 BFS 算法
 # ============================================================
 
 def _compute_gravity_scores(
@@ -1712,7 +1740,10 @@ def _build_one_admin(
     int,
 ]:
     """
-    对一个 city × admin_code 独立运行完整算法。
+    对一个划分范围独立运行完整算法。
+
+    开启行政街道限制时，范围是 city × admin_code；
+    关闭时，范围是整个 city，admin_code/admin_name 使用城市级标识。
 
     返回：
     grid_rows
@@ -1902,6 +1933,9 @@ def _build_one_admin(
                 "city": city,
                 "admin_code": admin_code,
                 "admin_name": admin_name,
+                "admin_restriction_enabled": bool(
+                    config.restrict_to_admin_street
+                ),
                 "seed_h3": seed,
                 "seed_lat": seed_lat,
                 "seed_lng": seed_lng,
@@ -1934,6 +1968,9 @@ def _build_one_admin(
                     "city": city,
                     "admin_code": admin_code,
                     "admin_name": admin_name,
+                    "admin_restriction_enabled": bool(
+                        config.restrict_to_admin_street
+                    ),
                     "h3_id": cell,
                     "h3_fyp": float(fyp.get(cell, 0.0)),
                     "h3_customer_count": int(
@@ -1991,6 +2028,9 @@ def _build_one_admin(
                     "city": city,
                     "admin_code": admin_code,
                     "admin_name": admin_name,
+                    "admin_restriction_enabled": bool(
+                        config.restrict_to_admin_street
+                    ),
                     "seed_h3": seed,
                     "seed_fyp": float(fyp.get(seed, 0.0)),
                     "seed_customer_count": int(
@@ -2103,6 +2143,9 @@ def _build_one_admin(
                 "city": city,
                 "admin_code": admin_code,
                 "admin_name": admin_name,
+                "admin_restriction_enabled": bool(
+                    config.restrict_to_admin_street
+                ),
                 "h3_id": island,
                 "h3_fyp": float(fyp.get(island, 0.0)),
                 "h3_customer_count": int(
@@ -2150,6 +2193,9 @@ def _build_one_admin(
             "city": city,
             "admin_code": admin_code,
             "admin_name": admin_name,
+            "admin_restriction_enabled": bool(
+                config.restrict_to_admin_street
+            ),
             "seed_h3": grid["seed_h3"],
             "seed_lat": float(grid["seed_lat"]),
             "seed_lng": float(grid["seed_lng"]),
@@ -2181,6 +2227,17 @@ def _build_one_admin(
                 grid["main_expansion_layers"]
             ),
             "grid_status": "SUCCESS",
+            "grid_geometry_geojson": None,
+            "grid_geometry_geojson_wgs84": None,
+            "grid_geometry_geojson_gcj02": None,
+            "grid_centroid_wgs84_lng": None,
+            "grid_centroid_wgs84_lat": None,
+            "grid_centroid_gcj02_lng": None,
+            "grid_centroid_gcj02_lat": None,
+            "grid_label_point_wgs84_lng": None,
+            "grid_label_point_wgs84_lat": None,
+            "grid_label_point_gcj02_lng": None,
+            "grid_label_point_gcj02_lat": None,
         }
 
         if config.build_grid_geometry:
@@ -2202,13 +2259,49 @@ def _build_one_admin(
                     mapping(grid_geom_gcj02),
                     ensure_ascii=False,
                 )
+
+                # centroid 是合并后 Polygon/MultiPolygon 的几何质心；
+                # 对凹形或离散 MultiPolygon，质心可能位于地块外。
+                centroid_wgs84 = grid_geom.centroid
+                centroid_gcj02_lng, centroid_gcj02_lat = (
+                    wgs84_to_gcj02(
+                        centroid_wgs84.x,
+                        centroid_wgs84.y,
+                    )
+                )
+                row["grid_centroid_wgs84_lng"] = float(
+                    centroid_wgs84.x
+                )
+                row["grid_centroid_wgs84_lat"] = float(
+                    centroid_wgs84.y
+                )
+                row["grid_centroid_gcj02_lng"] = float(
+                    centroid_gcj02_lng
+                )
+                row["grid_centroid_gcj02_lat"] = float(
+                    centroid_gcj02_lat
+                )
+
+                # representative_point 保证位于 Geometry 内，适合作为
+                # 高德地图上的标签、气泡或点击标记位置。
+                label_point_wgs84 = grid_geom.representative_point()
+                label_point_gcj02 = grid_geom_gcj02.representative_point()
+                row["grid_label_point_wgs84_lng"] = float(
+                    label_point_wgs84.x
+                )
+                row["grid_label_point_wgs84_lat"] = float(
+                    label_point_wgs84.y
+                )
+                row["grid_label_point_gcj02_lng"] = float(
+                    label_point_gcj02.x
+                )
+                row["grid_label_point_gcj02_lat"] = float(
+                    label_point_gcj02.y
+                )
             except Exception as exc:
                 warnings.warn(
                     f"grid_id={grid_id} Geometry 输出失败：{exc}"
                 )
-                row["grid_geometry_geojson"] = None
-                row["grid_geometry_geojson_wgs84"] = None
-                row["grid_geometry_geojson_gcj02"] = None
 
         grid_rows.append(row)
 
@@ -2226,6 +2319,9 @@ def _build_one_admin(
                 "city": city,
                 "admin_code": admin_code,
                 "admin_name": admin_name,
+                "admin_restriction_enabled": bool(
+                    config.restrict_to_admin_street
+                ),
                 "h3_id": cell,
                 "h3_fyp": float(fyp.get(cell, 0.0)),
                 "h3_customer_count": int(
@@ -2265,8 +2361,9 @@ def run_partition_on_h3_pool(
     pd.DataFrame,
 ]:
     """
-    按 city × admin_code 串行运行。
-    行政街道之间完全隔离，因此天然保证不跨行政街道。
+    按配置选择划分范围：
+    - restrict_to_admin_street=True：按 city × admin_code，不能跨街道；
+    - restrict_to_admin_street=False：按 city，允许跨街道但不能跨城市。
     """
 
     params = city_params.set_index("city").to_dict("index")
@@ -2282,10 +2379,34 @@ def run_partition_on_h3_pool(
         h3_pool["is_legal_unassigned"]
     ].copy()
 
-    for (city, admin_code), group in legal_pool.groupby(
-        ["city", "admin_code"],
-        sort=True,
-    ):
+    if config.restrict_to_admin_street:
+        partition_groups = (
+            (
+                str(city),
+                str(admin_code),
+                str(group["admin_name"].iloc[0]) if not group.empty else "",
+                group,
+            )
+            for (city, admin_code), group in legal_pool.groupby(
+                ["city", "admin_code"],
+                sort=True,
+            )
+        )
+    else:
+        partition_groups = (
+            (
+                str(city),
+                "CITY_WIDE",
+                "城市内跨行政街道",
+                group,
+            )
+            for city, group in legal_pool.groupby(
+                "city",
+                sort=True,
+            )
+        )
+
+    for city, admin_code, admin_name, group in partition_groups:
         if city not in params:
             raise ValueError(
                 f"城市 {city} 缺少距离/FYP 参数。"
@@ -2297,12 +2418,6 @@ def run_partition_on_h3_pool(
             "h3_id",
             kind="mergesort",
         ).copy()
-
-        admin_name = (
-            str(sub["admin_name"].iloc[0])
-            if not sub.empty
-            else ""
-        )
 
         (
             g_rows,
@@ -2436,6 +2551,7 @@ def build_grid_customer_detail(
 
     grid_required = [
         "grid_id",
+        "admin_restriction_enabled",
         "h3_count",
         "grid_fyp",
         "target_expected_fyp",
@@ -2448,6 +2564,14 @@ def build_grid_customer_detail(
         "distance_diameter_km",
         "expansion_layers",
         "grid_status",
+        "grid_centroid_wgs84_lng",
+        "grid_centroid_wgs84_lat",
+        "grid_centroid_gcj02_lng",
+        "grid_centroid_gcj02_lat",
+        "grid_label_point_wgs84_lng",
+        "grid_label_point_wgs84_lat",
+        "grid_label_point_gcj02_lng",
+        "grid_label_point_gcj02_lat",
     ]
 
     if grids.empty:
@@ -2543,6 +2667,7 @@ def build_grid_customer_detail(
         "grid_id",
         "grid_admin_code",
         "grid_admin_name",
+        "admin_restriction_enabled",
         "h3_assigned_to_grid",
         "has_successful_grid",
         "counts_toward_grid_customer_minimum",
@@ -2565,9 +2690,18 @@ def build_grid_customer_detail(
         "distance_diameter_km",
         "grid_expansion_layers",
         "grid_status",
+        "grid_centroid_wgs84_lng",
+        "grid_centroid_wgs84_lat",
+        "grid_centroid_gcj02_lng",
+        "grid_centroid_gcj02_lat",
+        "grid_label_point_wgs84_lng",
+        "grid_label_point_wgs84_lat",
+        "grid_label_point_gcj02_lng",
+        "grid_label_point_gcj02_lat",
         "_customer_id_available",
         "_valid_coordinate",
         "_input_coordinate_system",
+        "_admin_restriction_enabled",
         "_wgs84_lng",
         "_wgs84_lat",
         "_fyp_available",
@@ -2692,6 +2826,9 @@ def build_coverage_metrics(
         rows.append(
             {
                 "city": city,
+                "admin_restriction_enabled": bool(
+                    g["_admin_restriction_enabled"].iloc[0]
+                ),
 
                 "target_customer_count": total_n,
                 "missing_customer_id_record_count": (
