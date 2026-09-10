@@ -31,6 +31,11 @@ Windows PowerShell 激活虚拟环境：
 | `lat` | number | GCJ-02 纬度，范围 `[-90, 90]` |
 | `area_admin_code` | string | 当前数据实际为行政街道名称；开启街道限制时应与 `area_name` 对齐，关闭时可不提供 |
 | `expected_fyp` | number/null | 0 合法；空值客户仍计人数，但不贡献 FYP |
+| `aoi_id` | string/null | 客户所属 AOI；空值表示无 AOI，每条空值客户独立处理，不会归为同一组 |
+| `aoi_lng` | number/null | AOI 质心经度；`aoi_id` 非空时必填，并与其他空间输入使用相同坐标系 |
+| `aoi_lat` | number/null | AOI 质心纬度；同一 `aoi_id` 的质心经纬度必须一致 |
+
+客户表不需要预先聚合。同一 AOI 的原始客户行全部保留，算法只把它们的 H3 分配位置统一替换为 AOI 质心。最低人数仍按原始非空客户号去重，FYP 仍按原始客户行求和。
 
 ### 行政街道表
 
@@ -193,6 +198,9 @@ cp column_config.example.json column_config.json
   "customer_lat": "客户纬度",
   "customer_admin_code": "行政街道名称",
   "customer_expected_fyp": "预计FYP",
+  "customer_aoi_id": "AOI_ID",
+  "customer_aoi_lng": "AOI经度",
+  "customer_aoi_lat": "AOI纬度",
   "admin_city": "城市名称",
   "admin_code": "街道编码",
   "admin_name": "街道名称",

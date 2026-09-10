@@ -17,6 +17,7 @@
 - 最低客户数默认为 50，可通过 `AlgorithmConfig(min_customer_count=...)` 调整。
 - FYP 已达标但人数不足时继续扩张；半径或拓扑耗尽仍不达标则回滚。
 - 客户数按非空 `customer_id` 去重。`expected_fyp=0` 或为空的合法客户仍计人数；空值不贡献 FYP。
+- 非空 `aoi_id` 的客户统一使用该 AOI 的质心经纬度映射 H3，保证同一 AOI 最多进入一个专员格；空 `aoi_id` 客户仍各自使用客户坐标。
 
 ## 仓库结构
 
@@ -51,13 +52,25 @@ pip install -r requirements.txt
 
 | 输入 | 必需字段 | 说明 |
 |---|---|---|
-| 客户表 | `customer_id`, `city`, `lng`, `lat`, `area_admin_code`, `expected_fyp` | 经纬度为 GCJ-02；`area_admin_code` 当前实际存放行政街道名称，如“南桥镇”；关闭街道限制时该字段可不提供 |
+| 客户表 | `customer_id`, `city`, `lng`, `lat`, `area_admin_code`, `expected_fyp`, `aoi_id`, `aoi_lng`, `aoi_lat` | 经纬度均为 GCJ-02；非空 AOI 必须有一致质心；空 `aoi_id` 之间互不归组；关闭街道限制时 `area_admin_code` 可不提供 |
 | 行政街道表 | `city`, `area_code`, `area_name`, `area_geometry` | 每个 `city + area_code` 一行；Geometry 支持 GeoJSON、WKT、WKB/EWKB Hex；坐标为 GCJ-02 |
 | 已有网格表 | `city`, `agent_net_id`, `basic_net_id`, `basic_net_geom` | GCJ-02 已占用空间，不参与新专员格划分 |
 | FYP 门槛表 | `city`, `target_expected_fyp` | 每个城市的最低 FYP |
 | 距离表 | `city`, `distance_km` | 专员格最大跨度/直径，算法自动除以 2 |
 
 字段名不一致时，通过 `ColumnConfig` 映射，无需修改算法主体。
+
+AOI 输入不需要提前聚合成一行。算法保留原始客户明细：同一 AOI 的客户共享一个 AOI 质心 H3，但最低人数仍按原始非空客户号去重，FYP 仍按原始客户求和。`aoi_id` 非空但质心经纬度缺失、同一 AOI 跨城市或质心不一致时会直接报错。
+
+如果实际列名为大写或中文，可配置：
+
+```python
+cols = ColumnConfig(
+    customer_aoi_id="AOI_ID",
+    customer_aoi_lng="AOI经度",
+    customer_aoi_lat="AOI纬度",
+)
+```
 
 ## Notebook 快速开始
 

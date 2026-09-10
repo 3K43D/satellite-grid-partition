@@ -116,7 +116,7 @@
 | `admin_restriction_enabled` | 本次运行是否启用行政街道硬边界 |
 | `target_customer_count` | 非空客户号数量；客户号已全局去重 |
 | `missing_customer_id_record_count` | 客户号为空的记录数，不进入人数分母 |
-| `valid_coordinate_count` | 非空客户号中经纬度有效的数量 |
+| `valid_coordinate_count` | 非空客户号中分配坐标有效的数量；有 AOI 时检查 AOI 质心，无 AOI 时检查客户坐标 |
 | `valid_coordinate_rate` | `valid_coordinate_count / target_customer_count` |
 | `fyp_available_count` | 非空客户号中 FYP 非空的数量 |
 | `fyp_available_rate` | `fyp_available_count / target_customer_count` |
@@ -173,9 +173,17 @@
 | `_lng`, `_lat` | 转成数值后的经纬度 |
 | `_input_coordinate_system` | 输入坐标系，当前为 `GCJ02` |
 | `_admin_restriction_enabled` | 本次运行是否启用行政街道硬边界 |
-| `_wgs84_lng`, `_wgs84_lat` | 送入 H3 的 WGS84 客户坐标 |
+| `_customer_coordinate_valid` | 原始客户经纬度是否合法 |
+| `_customer_wgs84_lng`, `_customer_wgs84_lat` | 原始客户坐标转换后的 WGS84 |
+| `_aoi_id_norm`, `_has_aoi` | 标准化 AOI ID，以及该客户是否具有 AOI |
+| `_aoi_lng_canonical`, `_aoi_lat_canonical` | 同一 AOI 统一后的代表质心经纬度 |
+| `_aoi_customer_count`, `_aoi_expected_fyp` | AOI 原始去重客户数和 FYP 合计，仅用于解释与验收 |
+| `_allocation_lng`, `_allocation_lat` | 实际分配坐标；有 AOI 使用 AOI 质心，否则使用客户坐标 |
+| `_allocation_wgs84_lng`, `_allocation_wgs84_lat` | 实际送入 H3 的 WGS84 分配坐标 |
+| `_allocation_coordinate_source` | `AOI_CENTROID` 或 `CUSTOMER_POINT` |
+| `_wgs84_lng`, `_wgs84_lat` | 向后兼容字段，等同实际 H3 分配坐标的 WGS84 值 |
 | `_fyp` | 转成数值后的 FYP；无法解析时为空 |
-| `_valid_coordinate` | 经纬度是否有效 |
+| `_valid_coordinate` | 实际分配坐标是否有效 |
 | `_fyp_available` | FYP 是否可用；0 为可用 |
 | `_h3_id` | 客户坐标映射的 H3；失败时为空 |
 | `_h3_admin_code`, `_h3_admin_name` | 由 H3 中心和行政 Geometry 判定的街道 |
@@ -201,10 +209,16 @@
 | `customer_id`, `city` | 客户号和城市 |
 | `customer_lng`, `customer_lat` | 数值化经纬度 |
 | `customer_coordinate_system` | 上述客户坐标的坐标系，当前为 `GCJ02` |
-| `customer_wgs84_lng`, `customer_wgs84_lat` | H3 使用的 WGS84 客户坐标 |
+| `customer_wgs84_lng`, `customer_wgs84_lat` | 原始客户坐标转换后的 WGS84 |
 | `expected_fyp` | 数值化客户 FYP |
+| `aoi_id`, `has_aoi` | 原始 AOI ID 和是否具有 AOI；空 AOI 客户互不归组 |
+| `aoi_lng`, `aoi_lat` | 同一 AOI 统一后的代表质心经纬度 |
+| `aoi_customer_count`, `aoi_expected_fyp` | AOI 中原始去重客户数和 FYP 合计 |
+| `allocation_lng`, `allocation_lat` | 实际用于分配的位置；有 AOI 时为 AOI 质心，否则为客户位置 |
+| `allocation_wgs84_lng`, `allocation_wgs84_lat` | 实际送入 H3 的 WGS84 分配坐标 |
+| `allocation_coordinate_source` | `AOI_CENTROID` 或 `CUSTOMER_POINT` |
 | `customer_admin_name` | 客户表行政街道名称 |
-| `h3_id` | 客户所在 H3 |
+| `h3_id` | 实际分配坐标所在 H3；有 AOI 时是 AOI 质心 H3，否则是客户 H3 |
 | `_h3_admin_code`, `_h3_admin_name` | Geometry 判定的行政街道 |
 
 ### 最终分配判断

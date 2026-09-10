@@ -11,7 +11,8 @@
 2. 使用 H3 官方 Cell Center（中心点）判断：
    - H3 属于哪个行政街道；
    - H3 是否落入已有基础网格占用区域；
-3. 将目标客户经纬度映射到 H3，并在 H3 级聚合 expected_fyp；
+3. 有 AOI 的客户统一使用 AOI 质心、无 AOI 的客户使用自身坐标映射 H3，
+   并在 H3 级聚合原始客户人数与 expected_fyp；
 4. 对没有客户的合法 H3 保留记录并赋值 0，保证空间拓扑连续；
 5. 在每个“城市 × 行政街道”内部独立运行：
    - 高引力种子选择；
@@ -55,6 +56,8 @@ L. 每个成功专员格必须同时满足最低 FYP 与最低去重客户数；
    最低客户数默认为 50，可通过 AlgorithmConfig 调整。
 M. 客户数按非空 customer_id 去重计算；expected_fyp=0 仍计入客户数，
    expected_fyp 为空的合法客户也计入客户数，但不贡献 FYP。
+N. 同一非空 AOI_ID 必须使用一致的质心经纬度并统一映射到一个 H3，
+   因此最多只能进入一个专员格；AOI_ID 为空的客户互不归组。
 
 建议安装
 --------
@@ -183,6 +186,13 @@ class ColumnConfig:
     # ---------- 城市距离表 ----------
     distance_city: str = "city"
     distance_km: str = "distance_km"
+
+    # ---------- 客户 AOI ----------
+    # AOI_ID 为空表示该客户没有 AOI，空值之间互不构成同一分配单元。
+    # 非空 AOI 的 lng/lat 是同一 AOI 共用的代表质心点。
+    customer_aoi_id: str = "aoi_id"
+    customer_aoi_lng: str = "aoi_lng"
+    customer_aoi_lat: str = "aoi_lat"
 
 
 @dataclass(frozen=True)
@@ -1381,6 +1391,8 @@ def prepare_customers_and_attach_fyp(
       不将该客户 FYP 计入网格算法，并在诊断表中标记。
     - restrict_to_admin_street=False 时，街道名称仅保留用于诊断，
       不再影响客户人数和 FYP 资格。
+    - 非空 AOI_ID 使用统一 AOI 质心作为 H3 分配位置；空 AOI_ID
+      继续使用客户自身坐标。原始客户行不会被聚合删除。
     """
 
     required = [
@@ -1389,6 +1401,9 @@ def prepare_customers_and_attach_fyp(
         cols.customer_lng,
         cols.customer_lat,
         cols.customer_expected_fyp,
+        cols.customer_aoi_id,
+        cols.customer_aoi_lng,
+        cols.customer_aoi_lat,
     ]
 
     # 客户行政街道是强烈建议字段。
@@ -1426,6 +1441,18 @@ def prepare_customers_and_attach_fyp(
         cust[cols.customer_expected_fyp],
         errors="coerce",
     )
+    cust["_aoi_id_norm"] = cust[
+        cols.customer_aoi_id
+    ].map(_normalize_code)
+    cust["_has_aoi"] = cust["_aoi_id_norm"] != ""
+    cust["_aoi_lng"] = pd.to_numeric(
+        cust[cols.customer_aoi_lng],
+        errors="coerce",
+    )
+    cust["_aoi_lat"] = pd.to_numeric(
+        cust[cols.customer_aoi_lat],
+        errors="coerce",
+    )
 
     if cols.customer_admin_code in cust.columns:
         cust["_customer_admin_name_norm"] = cust[
@@ -1442,6 +1469,9 @@ def prepare_customers_and_attach_fyp(
         "_lat",
         "_fyp",
         "_customer_admin_name_norm",
+        "_aoi_id_norm",
+        "_aoi_lng",
+        "_aoi_lat",
     ]
     customer_rows_before_dedup = len(cust)
     cust = cust.drop_duplicates(
@@ -1451,7 +1481,7 @@ def prepare_customers_and_attach_fyp(
     exact_duplicates_removed = customer_rows_before_dedup - len(cust)
     if exact_duplicates_removed > 0:
         warnings.warn(
-            "客户表已按客户号、城市、经纬度、街道名称和 FYP "
+            "客户表已按客户号、城市、客户经纬度、AOI信息、街道名称和 FYP "
             f"去除 {exact_duplicates_removed:,} 条完全重复记录。"
         )
 
@@ -1469,6 +1499,9 @@ def prepare_customers_and_attach_fyp(
                     cols.customer_lng,
                     cols.customer_lat,
                     cols.customer_expected_fyp,
+                    cols.customer_aoi_id,
+                    cols.customer_aoi_lng,
+                    cols.customer_aoi_lat,
                 ]
                 + (
                     [cols.customer_admin_code]
@@ -1490,33 +1523,194 @@ def prepare_customers_and_attach_fyp(
             f"示例：\n{examples}"
         )
 
-    cust["_valid_coordinate"] = (
+    # 非空 AOI_ID 必须具有完整、合法且一致的代表质心。
+    aoi_coordinate_valid = (
+        cust["_aoi_lng"].between(-180, 180)
+        & cust["_aoi_lat"].between(-90, 90)
+    )
+    invalid_aoi_coordinate = cust["_has_aoi"] & (~aoi_coordinate_valid)
+    if invalid_aoi_coordinate.any():
+        examples = cust.loc[
+            invalid_aoi_coordinate,
+            [
+                cols.customer_id,
+                cols.customer_city,
+                cols.customer_aoi_id,
+                cols.customer_aoi_lng,
+                cols.customer_aoi_lat,
+            ],
+        ].head(20)
+        raise ValueError(
+            "检测到非空 AOI_ID 缺少合法的 aoi_lng/aoi_lat。\n"
+            f"示例：\n{examples}"
+        )
+
+    aoi_rows = cust[cust["_has_aoi"]].copy()
+    if not aoi_rows.empty:
+        aoi_city_count = aoi_rows.groupby(
+            "_aoi_id_norm",
+            sort=False,
+        )[cols.customer_city].nunique(dropna=False)
+        cross_city_aoi = aoi_city_count[aoi_city_count > 1]
+        if not cross_city_aoi.empty:
+            examples = cross_city_aoi.index.astype(str).tolist()[:20]
+            raise ValueError(
+                "同一个非空 AOI_ID 不能出现在多个城市。"
+                f"冲突 AOI 示例：{examples}"
+            )
+
+        aoi_coordinate_span = aoi_rows.groupby(
+            "_aoi_id_norm",
+            sort=False,
+        ).agg(
+            min_lng=("_aoi_lng", "min"),
+            max_lng=("_aoi_lng", "max"),
+            min_lat=("_aoi_lat", "min"),
+            max_lat=("_aoi_lat", "max"),
+        )
+        aoi_coordinate_tolerance = 1e-7
+        inconsistent_aoi_coordinate = aoi_coordinate_span[
+            (
+                aoi_coordinate_span["max_lng"]
+                - aoi_coordinate_span["min_lng"]
+                > aoi_coordinate_tolerance
+            )
+            | (
+                aoi_coordinate_span["max_lat"]
+                - aoi_coordinate_span["min_lat"]
+                > aoi_coordinate_tolerance
+            )
+        ]
+        if not inconsistent_aoi_coordinate.empty:
+            examples = (
+                inconsistent_aoi_coordinate.reset_index()
+                .head(20)
+                .to_dict("records")
+            )
+            raise ValueError(
+                "同一个 AOI_ID 的 aoi_lng/aoi_lat 必须一致。"
+                "当前容差为 1e-7 度。\n"
+                f"示例：{examples}"
+            )
+
+        # 即使输入坐标存在容差内的微小尾差，也统一为同一个数值，
+        # 从而从源头保证同一 AOI 只会映射到一个 H3。
+        canonical_aoi_coordinate = aoi_rows.groupby(
+            "_aoi_id_norm",
+            sort=False,
+        ).agg(
+            canonical_aoi_lng=("_aoi_lng", "mean"),
+            canonical_aoi_lat=("_aoi_lat", "mean"),
+        )
+        cust["_aoi_lng_canonical"] = cust["_aoi_id_norm"].map(
+            canonical_aoi_coordinate["canonical_aoi_lng"]
+        )
+        cust["_aoi_lat_canonical"] = cust["_aoi_id_norm"].map(
+            canonical_aoi_coordinate["canonical_aoi_lat"]
+        )
+    else:
+        cust["_aoi_lng_canonical"] = np.nan
+        cust["_aoi_lat_canonical"] = np.nan
+
+    cust["_customer_coordinate_valid"] = (
         cust["_lng"].between(-180, 180)
         & cust["_lat"].between(-90, 90)
+    )
+    cust["_aoi_coordinate_valid"] = (
+        cust["_has_aoi"] & aoi_coordinate_valid
+    )
+    cust["_allocation_lng"] = np.where(
+        cust["_has_aoi"],
+        cust["_aoi_lng_canonical"],
+        cust["_lng"],
+    )
+    cust["_allocation_lat"] = np.where(
+        cust["_has_aoi"],
+        cust["_aoi_lat_canonical"],
+        cust["_lat"],
+    )
+    cust["_allocation_coordinate_source"] = np.where(
+        cust["_has_aoi"],
+        "AOI_CENTROID",
+        "CUSTOMER_POINT",
+    )
+    cust["_valid_coordinate"] = (
+        cust["_allocation_lng"].between(-180, 180)
+        & cust["_allocation_lat"].between(-90, 90)
     )
 
     source_coordinate_system = normalize_coordinate_system(
         config.input_coordinate_system
     )
-    valid_coordinate_mask = cust["_valid_coordinate"].to_numpy(dtype=bool)
-    input_lng = cust["_lng"].to_numpy(dtype=np.float64)
-    input_lat = cust["_lat"].to_numpy(dtype=np.float64)
-    wgs84_lng = np.full(len(cust), np.nan, dtype=np.float64)
-    wgs84_lat = np.full(len(cust), np.nan, dtype=np.float64)
 
-    if source_coordinate_system == "GCJ02":
-        converted_lng, converted_lat = gcj02_to_wgs84_array(
-            input_lng[valid_coordinate_mask],
-            input_lat[valid_coordinate_mask],
+    def convert_input_arrays_to_wgs84(
+        input_lng: np.ndarray,
+        input_lat: np.ndarray,
+        valid_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        output_lng = np.full(input_lng.shape, np.nan, dtype=np.float64)
+        output_lat = np.full(input_lat.shape, np.nan, dtype=np.float64)
+        if source_coordinate_system == "GCJ02":
+            converted_lng, converted_lat = gcj02_to_wgs84_array(
+                input_lng[valid_mask],
+                input_lat[valid_mask],
+            )
+        else:
+            converted_lng = input_lng[valid_mask]
+            converted_lat = input_lat[valid_mask]
+        output_lng[valid_mask] = converted_lng
+        output_lat[valid_mask] = converted_lat
+        return output_lng, output_lat
+
+    customer_wgs84_lng, customer_wgs84_lat = convert_input_arrays_to_wgs84(
+        cust["_lng"].to_numpy(dtype=np.float64),
+        cust["_lat"].to_numpy(dtype=np.float64),
+        cust["_customer_coordinate_valid"].to_numpy(dtype=bool),
+    )
+    # 无 AOI 客户的分配坐标与客户坐标相同，可直接复用转换结果；
+    # AOI 质心只按唯一 AOI 转换一次，再映射回成员客户，避免重复反算。
+    allocation_wgs84_lng = customer_wgs84_lng.copy()
+    allocation_wgs84_lat = customer_wgs84_lat.copy()
+    if not aoi_rows.empty:
+        unique_aoi_lng = canonical_aoi_coordinate[
+            "canonical_aoi_lng"
+        ].to_numpy(dtype=np.float64)
+        unique_aoi_lat = canonical_aoi_coordinate[
+            "canonical_aoi_lat"
+        ].to_numpy(dtype=np.float64)
+        unique_aoi_valid = np.ones(len(canonical_aoi_coordinate), dtype=bool)
+        unique_aoi_wgs84_lng, unique_aoi_wgs84_lat = (
+            convert_input_arrays_to_wgs84(
+                unique_aoi_lng,
+                unique_aoi_lat,
+                unique_aoi_valid,
+            )
         )
-    else:
-        converted_lng = input_lng[valid_coordinate_mask]
-        converted_lat = input_lat[valid_coordinate_mask]
+        aoi_wgs84_lng_by_id = pd.Series(
+            unique_aoi_wgs84_lng,
+            index=canonical_aoi_coordinate.index,
+        )
+        aoi_wgs84_lat_by_id = pd.Series(
+            unique_aoi_wgs84_lat,
+            index=canonical_aoi_coordinate.index,
+        )
+        has_aoi_mask = cust["_has_aoi"].to_numpy(dtype=bool)
+        allocation_wgs84_lng[has_aoi_mask] = cust.loc[
+            cust["_has_aoi"],
+            "_aoi_id_norm",
+        ].map(aoi_wgs84_lng_by_id).to_numpy(dtype=np.float64)
+        allocation_wgs84_lat[has_aoi_mask] = cust.loc[
+            cust["_has_aoi"],
+            "_aoi_id_norm",
+        ].map(aoi_wgs84_lat_by_id).to_numpy(dtype=np.float64)
 
-    wgs84_lng[valid_coordinate_mask] = converted_lng
-    wgs84_lat[valid_coordinate_mask] = converted_lat
-    cust["_wgs84_lng"] = wgs84_lng
-    cust["_wgs84_lat"] = wgs84_lat
+    cust["_customer_wgs84_lng"] = customer_wgs84_lng
+    cust["_customer_wgs84_lat"] = customer_wgs84_lat
+    cust["_allocation_wgs84_lng"] = allocation_wgs84_lng
+    cust["_allocation_wgs84_lat"] = allocation_wgs84_lat
+    # 向后兼容：原内部字段现在明确表示真正送入 H3 的分配坐标。
+    cust["_wgs84_lng"] = allocation_wgs84_lng
+    cust["_wgs84_lat"] = allocation_wgs84_lat
     cust["_input_coordinate_system"] = source_coordinate_system
     cust["_admin_restriction_enabled"] = bool(
         config.restrict_to_admin_street
@@ -1540,23 +1734,61 @@ def prepare_customers_and_attach_fyp(
                 f"示例：\n{examples}"
             )
 
-    # 经纬度有效才做 H3
+    # AOI 汇总指标只用于解释和验收；真正进入 H3 聚合时仍保留每个
+    # 原始客户行，因此最低人数按 customer_id 去重、FYP 按客户求和。
+    cust["_aoi_customer_count"] = pd.Series(
+        pd.NA,
+        index=cust.index,
+        dtype="Int64",
+    )
+    cust["_aoi_expected_fyp"] = np.nan
+    if cust["_has_aoi"].any():
+        aoi_member_rows = cust[cust["_has_aoi"]]
+        aoi_customer_count = aoi_member_rows.groupby(
+            "_aoi_id_norm",
+            sort=False,
+        )["_customer_id_norm"].transform(
+            lambda values: values[values != ""].nunique()
+        )
+        aoi_expected_fyp = aoi_member_rows.groupby(
+            "_aoi_id_norm",
+            sort=False,
+        )["_fyp"].transform(
+            lambda values: values.sum(min_count=1)
+        )
+        cust.loc[
+            cust["_has_aoi"],
+            "_aoi_customer_count",
+        ] = aoi_customer_count.astype("Int64")
+        cust.loc[
+            cust["_has_aoi"],
+            "_aoi_expected_fyp",
+        ] = aoi_expected_fyp.astype(float)
+
+    # 分配坐标有效才做 H3。同一 AOI 的统一质心通过缓存只计算一次，
+    # 避免一个大型 AOI 的每位客户重复调用 H3。
     h3_ids: List[Optional[str]] = []
-    for _, row in cust.iterrows():
-        if not bool(row["_valid_coordinate"]):
+    h3_by_coordinate: Dict[Tuple[float, float], Optional[str]] = {}
+    for valid, lat, lng in zip(
+        cust["_valid_coordinate"].to_numpy(dtype=bool),
+        cust["_allocation_wgs84_lat"].to_numpy(dtype=np.float64),
+        cust["_allocation_wgs84_lng"].to_numpy(dtype=np.float64),
+    ):
+        if not bool(valid):
             h3_ids.append(None)
             continue
 
-        try:
-            h3_ids.append(
-                h3_latlng_to_cell(
-                    row["_wgs84_lat"],
-                    row["_wgs84_lng"],
+        coordinate_key = (float(lat), float(lng))
+        if coordinate_key not in h3_by_coordinate:
+            try:
+                h3_by_coordinate[coordinate_key] = h3_latlng_to_cell(
+                    lat,
+                    lng,
                     config.h3_resolution,
                 )
-            )
-        except Exception:
-            h3_ids.append(None)
+            except Exception:
+                h3_by_coordinate[coordinate_key] = None
+        h3_ids.append(h3_by_coordinate[coordinate_key])
 
     cust["_h3_id"] = h3_ids
 
@@ -2611,9 +2843,26 @@ def build_grid_customer_detail(
     detail["customer_coordinate_system"] = detail[
         "_input_coordinate_system"
     ]
-    detail["customer_wgs84_lng"] = detail["_wgs84_lng"]
-    detail["customer_wgs84_lat"] = detail["_wgs84_lat"]
+    detail["customer_wgs84_lng"] = detail["_customer_wgs84_lng"]
+    detail["customer_wgs84_lat"] = detail["_customer_wgs84_lat"]
     detail["expected_fyp"] = detail["_fyp"]
+    detail["aoi_id"] = detail[cols.customer_aoi_id]
+    detail["aoi_lng"] = detail["_aoi_lng_canonical"]
+    detail["aoi_lat"] = detail["_aoi_lat_canonical"]
+    detail["has_aoi"] = detail["_has_aoi"]
+    detail["aoi_customer_count"] = detail["_aoi_customer_count"]
+    detail["aoi_expected_fyp"] = detail["_aoi_expected_fyp"]
+    detail["allocation_lng"] = detail["_allocation_lng"]
+    detail["allocation_lat"] = detail["_allocation_lat"]
+    detail["allocation_wgs84_lng"] = detail[
+        "_allocation_wgs84_lng"
+    ]
+    detail["allocation_wgs84_lat"] = detail[
+        "_allocation_wgs84_lat"
+    ]
+    detail["allocation_coordinate_source"] = detail[
+        "_allocation_coordinate_source"
+    ]
     detail["h3_id"] = detail["_h3_id"]
 
     if cols.customer_admin_code in detail.columns:
@@ -2660,6 +2909,17 @@ def build_grid_customer_detail(
         "customer_wgs84_lng",
         "customer_wgs84_lat",
         "expected_fyp",
+        "aoi_id",
+        "aoi_lng",
+        "aoi_lat",
+        "has_aoi",
+        "aoi_customer_count",
+        "aoi_expected_fyp",
+        "allocation_lng",
+        "allocation_lat",
+        "allocation_wgs84_lng",
+        "allocation_wgs84_lat",
+        "allocation_coordinate_source",
         "customer_admin_name",
         "h3_id",
         "_h3_admin_code",
@@ -2702,6 +2962,23 @@ def build_grid_customer_detail(
         "_valid_coordinate",
         "_input_coordinate_system",
         "_admin_restriction_enabled",
+        "_customer_coordinate_valid",
+        "_customer_wgs84_lng",
+        "_customer_wgs84_lat",
+        "_aoi_id_norm",
+        "_has_aoi",
+        "_aoi_lng",
+        "_aoi_lat",
+        "_aoi_lng_canonical",
+        "_aoi_lat_canonical",
+        "_aoi_coordinate_valid",
+        "_aoi_customer_count",
+        "_aoi_expected_fyp",
+        "_allocation_lng",
+        "_allocation_lat",
+        "_allocation_wgs84_lng",
+        "_allocation_wgs84_lat",
+        "_allocation_coordinate_source",
         "_wgs84_lng",
         "_wgs84_lat",
         "_fyp_available",
@@ -2723,6 +3000,49 @@ def build_grid_customer_detail(
     ]
 
     return detail[front + remaining].reset_index(drop=True)
+
+
+# ============================================================
+# 10.1 AOI 唯一归属校验
+# ============================================================
+
+def validate_aoi_single_grid(
+    grid_customer_detail: pd.DataFrame,
+) -> None:
+    """保证每个非空 AOI 只映射一个 H3，且最多进入一个专员格。"""
+    if grid_customer_detail.empty:
+        return
+
+    aoi_rows = grid_customer_detail[
+        grid_customer_detail["_has_aoi"].fillna(False)
+    ].copy()
+    if aoi_rows.empty:
+        return
+
+    aoi_h3_count = aoi_rows.groupby(
+        "_aoi_id_norm",
+        sort=False,
+    )["_h3_id"].nunique(dropna=True)
+    split_h3 = aoi_h3_count[aoi_h3_count > 1]
+    if not split_h3.empty:
+        examples = split_h3.head(20).to_dict()
+        raise AssertionError(
+            "AOI 唯一 H3 校验失败：同一 AOI 被映射到多个 H3。"
+            f"示例：{examples}"
+        )
+
+    assigned_aoi_rows = aoi_rows[aoi_rows["grid_id"].notna()]
+    aoi_grid_count = assigned_aoi_rows.groupby(
+        "_aoi_id_norm",
+        sort=False,
+    )["grid_id"].nunique(dropna=True)
+    split_grid = aoi_grid_count[aoi_grid_count > 1]
+    if not split_grid.empty:
+        examples = split_grid.head(20).to_dict()
+        raise AssertionError(
+            "AOI 唯一专员格校验失败：同一 AOI 被分配到多个专员格。"
+            f"示例：{examples}"
+        )
 
 
 # ============================================================
@@ -3151,7 +3471,8 @@ def run_satellite_grid_algorithm(
     ----
     customer_df
         客户表：
-        customer_id, city, lng, lat, area_admin_code, expected_fyp
+        customer_id, city, lng, lat, area_admin_code, expected_fyp,
+        aoi_id, aoi_lng, aoi_lat
 
     admin_df
         行政街道表：
@@ -3265,6 +3586,9 @@ def run_satellite_grid_algorithm(
         h3_detail,
         cols,
     )
+
+    # 同一非空 AOI 必须只有一个 H3，且最多进入一个成功专员格。
+    validate_aoi_single_grid(grid_customer_detail)
 
     # 8. 覆盖率
     coverage = build_coverage_metrics(

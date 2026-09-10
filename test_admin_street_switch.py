@@ -81,6 +81,9 @@ def _make_inputs():
     )
 
     customer_df = pd.DataFrame(customers)
+    customer_df["aoi_id"] = pd.NA
+    customer_df["aoi_lng"] = pd.NA
+    customer_df["aoi_lat"] = pd.NA
     existing_grid_df = pd.DataFrame(
         [
             {
