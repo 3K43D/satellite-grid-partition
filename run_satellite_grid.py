@@ -17,9 +17,13 @@ from satellite_grid_partition_v1 import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="从五张输入表运行卫星网点专员格划分算法。",
+        description="运行卫星网点专员格划分及网点归属算法。",
     )
     parser.add_argument("--customer", required=True, help="客户表路径")
+    parser.add_argument(
+        "--outlet",
+        help="可选网点经纬度表路径；用于 Grid 和客户归属网点",
+    )
     parser.add_argument("--admin", required=True, help="行政街道表路径")
     parser.add_argument(
         "--existing-grid",
@@ -140,6 +144,11 @@ def main() -> None:
         distance_df=load_table(args.distance),
         cols=cols,
         config=config,
+        outlet_df=(
+            load_table(args.outlet)
+            if args.outlet
+            else None
+        ),
     )
 
     print("2/4 算法与一致性校验完成。")

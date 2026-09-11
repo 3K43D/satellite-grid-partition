@@ -19,5 +19,10 @@
   "threshold_city": "city",
   "threshold_fyp": "target_expected_fyp",
   "distance_city": "city",
-  "distance_km": "distance_km"
+  "distance_km": "distance_km",
+  "outlet_secondary_org": "二级机构",
+  "outlet_city": "城市",
+  "outlet_name": "网点名称-正式",
+  "outlet_lng": "经度",
+  "outlet_lat": "纬度"
 }

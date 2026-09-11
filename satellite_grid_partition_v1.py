@@ -22,7 +22,9 @@
    - 同时达到城市 target_expected_fyp 与最低客户数后立即提交；
    - 失败事务回滚，失败 Seed 仅禁止再次作为 Seed，但仍可被其他网格吸收；
 6. 主循环结束后，将剩余 H3 作为孤岛进行单向吸附；
-7. 输出 Grid、H3 明细、客户—专员格明细、失败 Seed、废弃 H3、
+7. 划分完成后按城市将成功专员格归属到唯一或最近网点，
+   客户继承所属成功专员格的网点；
+8. 输出 Grid、H3 明细、客户—专员格明细、失败 Seed、废弃 H3、
    覆盖率漏斗、H3 中间池等结果。
 
 当前明确锁死的业务口径
@@ -58,6 +60,9 @@ M. 客户数按非空 customer_id 去重计算；expected_fyp=0 仍计入客户�
    expected_fyp 为空的合法客户也计入客户数，但不贡献 FYP。
 N. 同一非空 AOI_ID 必须使用一致的质心经纬度并统一映射到一个 H3，
    因此最多只能进入一个专员格；AOI_ID 为空的客户互不归组。
+O. 网点坐标使用 GCJ-02。候选网点只按城市筛选；城市内只有一个网点时
+   直接归属，有多个时选择距 Grid GCJ-02 几何质心最近的网点，距离相同
+   时按网点名称升序；二级机构为省，只随结果输出。
 
 建议安装
 --------
@@ -97,6 +102,7 @@ result = run_satellite_grid_algorithm(
     existing_grid_df=existing_grid_df,
     fyp_threshold_df=fyp_threshold_df,
     distance_df=distance_df,
+    outlet_df=outlet_df,
     config=config,
 )
 
@@ -196,6 +202,15 @@ class ColumnConfig:
     customer_aoi_id: str = "aoi_id"
     customer_aoi_lng: str = "aoi_lng"
     customer_aoi_lat: str = "aoi_lat"
+
+    # ---------- 网点经纬度表 ----------
+    # 二级机构当前是省级信息，仅跟随归属网点输出，
+    # 不参与候选网点筛选；候选范围只使用城市。
+    outlet_secondary_org: str = "二级机构"
+    outlet_city: str = "城市"
+    outlet_name: str = "网点名称-正式"
+    outlet_lng: str = "经度"
+    outlet_lat: str = "纬度"
 
 
 @dataclass(frozen=True)
@@ -2825,6 +2840,238 @@ def run_partition_on_h3_pool(
 
 
 # ============================================================
+# 9.1 专员格—网点归属
+# ============================================================
+
+OUTLET_ASSIGNMENT_COLUMNS = [
+    "assigned_secondary_org",
+    "assigned_outlet_name",
+    "assigned_outlet_lng",
+    "assigned_outlet_lat",
+    "distance_to_assigned_outlet_km",
+    "outlet_assignment_method",
+]
+
+
+def prepare_outlets(
+    outlet_df: Optional[pd.DataFrame],
+    cols: ColumnConfig,
+) -> pd.DataFrame:
+    """校验并标准化网点经纬度表。
+
+    网点坐标与 Grid 展示质心均使用 GCJ-02。二级机构
+    仅作为省级属性输出，不参与同城市候选网点筛选。
+    """
+    standard_columns = [
+        "_outlet_city_norm",
+        "assigned_secondary_org",
+        "assigned_outlet_name",
+        "assigned_outlet_lng",
+        "assigned_outlet_lat",
+    ]
+    if outlet_df is None:
+        return pd.DataFrame(columns=standard_columns)
+
+    required = [
+        cols.outlet_secondary_org,
+        cols.outlet_city,
+        cols.outlet_name,
+        cols.outlet_lng,
+        cols.outlet_lat,
+    ]
+    _require_columns(outlet_df, required, "网点经纬度表")
+
+    work = outlet_df[required].copy()
+    work["_outlet_city_norm"] = _normalize_code_series(
+        work[cols.outlet_city]
+    )
+    work["assigned_secondary_org"] = _normalize_code_series(
+        work[cols.outlet_secondary_org]
+    )
+    work["assigned_outlet_name"] = _normalize_code_series(
+        work[cols.outlet_name]
+    )
+    work["assigned_outlet_lng"] = pd.to_numeric(
+        work[cols.outlet_lng],
+        errors="coerce",
+    )
+    work["assigned_outlet_lat"] = pd.to_numeric(
+        work[cols.outlet_lat],
+        errors="coerce",
+    )
+
+    blank_city = work["_outlet_city_norm"] == ""
+    if blank_city.any():
+        examples = work.loc[blank_city, required].head(20)
+        raise ValueError(
+            "网点经纬度表存在空城市。\n"
+            f"示例：\n{examples}"
+        )
+
+    blank_name = work["assigned_outlet_name"] == ""
+    if blank_name.any():
+        examples = work.loc[blank_name, required].head(20)
+        raise ValueError(
+            "网点经纬度表存在空网点名称。\n"
+            f"示例：\n{examples}"
+        )
+
+    valid_coordinate = (
+        work["assigned_outlet_lng"].between(-180, 180)
+        & work["assigned_outlet_lat"].between(-90, 90)
+    )
+    if (~valid_coordinate).any():
+        examples = work.loc[~valid_coordinate, required].head(20)
+        raise ValueError(
+            "网点经纬度表存在缺失或非法的 GCJ-02 经纬度。\n"
+            f"示例：\n{examples}"
+        )
+
+    duplicated_outlet = work.duplicated(
+        ["_outlet_city_norm", "assigned_outlet_name"],
+        keep=False,
+    )
+    if duplicated_outlet.any():
+        examples = work.loc[
+            duplicated_outlet,
+            standard_columns,
+        ].head(20)
+        raise ValueError(
+            "网点经纬度表要求每个城市下的‘网点名称-正式’"
+            "唯一，但检测到重复。\n"
+            f"示例：\n{examples}"
+        )
+
+    return work[standard_columns].sort_values(
+        ["_outlet_city_norm", "assigned_outlet_name"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+
+def attach_outlets_to_grids(
+    grids: pd.DataFrame,
+    outlet_df: Optional[pd.DataFrame],
+    cols: ColumnConfig,
+) -> pd.DataFrame:
+    """按城市将每个成功 Grid 归属到唯一或最近网点。"""
+    # 即使本次没有成功 Grid，也先校验用户传入的网点表，
+    # 避免非法坐标因输出为空而被静默忽略。
+    outlets = prepare_outlets(outlet_df, cols)
+    result = grids.copy()
+    for column in OUTLET_ASSIGNMENT_COLUMNS:
+        result[column] = None
+
+    if result.empty:
+        return result
+
+    outlets_by_city = {
+        str(city): group.reset_index(drop=True)
+        for city, group in outlets.groupby(
+            "_outlet_city_norm",
+            sort=False,
+        )
+    }
+
+    for index, grid in result.iterrows():
+        city = str(grid["city"]).strip()
+        candidates = outlets_by_city.get(city)
+
+        if candidates is None or candidates.empty:
+            result.at[index, "outlet_assignment_method"] = (
+                "NO_OUTLET_IN_CITY"
+            )
+            continue
+
+        centroid_lng = pd.to_numeric(
+            pd.Series([grid["grid_centroid_gcj02_lng"]]),
+            errors="coerce",
+        ).iloc[0]
+        centroid_lat = pd.to_numeric(
+            pd.Series([grid["grid_centroid_gcj02_lat"]]),
+            errors="coerce",
+        ).iloc[0]
+        centroid_valid = (
+            pd.notna(centroid_lng)
+            and pd.notna(centroid_lat)
+            and -180 <= float(centroid_lng) <= 180
+            and -90 <= float(centroid_lat) <= 90
+        )
+
+        if len(candidates) == 1:
+            winner = candidates.iloc[0]
+            method = "ONLY_OUTLET_IN_CITY"
+            distance_km = (
+                haversine_distance_m(
+                    float(centroid_lat),
+                    float(centroid_lng),
+                    float(winner["assigned_outlet_lat"]),
+                    float(winner["assigned_outlet_lng"]),
+                )
+                / 1000.0
+                if centroid_valid
+                else np.nan
+            )
+        else:
+            if not centroid_valid:
+                raise ValueError(
+                    f"城市 {city} 有 {len(candidates)} 个候选网点，"
+                    f"但 grid_id={grid['grid_id']} 缺少合法的 "
+                    "grid_centroid_gcj02_lng/lat，无法判断最近网点。"
+                )
+
+            ranked_candidates = []
+            for candidate_index, candidate in candidates.iterrows():
+                distance_km = haversine_distance_m(
+                    float(centroid_lat),
+                    float(centroid_lng),
+                    float(candidate["assigned_outlet_lat"]),
+                    float(candidate["assigned_outlet_lng"]),
+                ) / 1000.0
+                ranked_candidates.append(
+                    (
+                        float(distance_km),
+                        str(candidate["assigned_outlet_name"]),
+                        int(candidate_index),
+                    )
+                )
+
+            distance_km, _name, winner_index = min(ranked_candidates)
+            winner = candidates.iloc[winner_index]
+            method = "NEAREST_TO_GRID_CENTROID"
+
+        result.at[index, "assigned_secondary_org"] = winner[
+            "assigned_secondary_org"
+        ]
+        result.at[index, "assigned_outlet_name"] = winner[
+            "assigned_outlet_name"
+        ]
+        result.at[index, "assigned_outlet_lng"] = float(
+            winner["assigned_outlet_lng"]
+        )
+        result.at[index, "assigned_outlet_lat"] = float(
+            winner["assigned_outlet_lat"]
+        )
+        result.at[index, "distance_to_assigned_outlet_km"] = float(
+            distance_km
+        )
+        result.at[index, "outlet_assignment_method"] = method
+
+    result["assigned_outlet_lng"] = pd.to_numeric(
+        result["assigned_outlet_lng"],
+        errors="coerce",
+    )
+    result["assigned_outlet_lat"] = pd.to_numeric(
+        result["assigned_outlet_lat"],
+        errors="coerce",
+    )
+    result["distance_to_assigned_outlet_km"] = pd.to_numeric(
+        result["distance_to_assigned_outlet_km"],
+        errors="coerce",
+    )
+    return result
+
+
+# ============================================================
 # 10. 客户—专员格明细
 # ============================================================
 
@@ -2943,6 +3190,12 @@ def build_grid_customer_detail(
         "grid_label_point_wgs84_lat",
         "grid_label_point_gcj02_lng",
         "grid_label_point_gcj02_lat",
+        "assigned_secondary_org",
+        "assigned_outlet_name",
+        "assigned_outlet_lng",
+        "assigned_outlet_lat",
+        "distance_to_assigned_outlet_km",
+        "outlet_assignment_method",
     ]
 
     if grids.empty:
@@ -3032,6 +3285,21 @@ def build_grid_customer_detail(
         ],
         default="UNASSIGNED",
     )
+    # 客户不单独计算最近网点：只继承所属 Grid 的网点。
+    # 没有成功 Grid 的客户保持网点字段为空。
+    no_successful_grid = ~detail["has_successful_grid"]
+    for column in [
+        "assigned_secondary_org",
+        "assigned_outlet_name",
+        "assigned_outlet_lng",
+        "assigned_outlet_lat",
+        "distance_to_assigned_outlet_km",
+    ]:
+        detail.loc[no_successful_grid, column] = None
+    detail.loc[
+        no_successful_grid,
+        "outlet_assignment_method",
+    ] = "NO_SUCCESSFUL_GRID"
 
     detail = detail.sort_values(
         "_customer_row_order",
@@ -3097,6 +3365,12 @@ def build_grid_customer_detail(
         "grid_label_point_wgs84_lat",
         "grid_label_point_gcj02_lng",
         "grid_label_point_gcj02_lat",
+        "assigned_secondary_org",
+        "assigned_outlet_name",
+        "assigned_outlet_lng",
+        "assigned_outlet_lat",
+        "distance_to_assigned_outlet_km",
+        "outlet_assignment_method",
         "_customer_id_available",
         "_valid_coordinate",
         "_input_coordinate_system",
@@ -3602,6 +3876,7 @@ def run_satellite_grid_algorithm(
     distance_df: pd.DataFrame,
     cols: Optional[ColumnConfig] = None,
     config: Optional[AlgorithmConfig] = None,
+    outlet_df: Optional[pd.DataFrame] = None,
 ) -> AlgorithmResult:
     """
     一键运行完整算法。
@@ -3631,6 +3906,12 @@ def run_satellite_grid_algorithm(
 
         注意：
         distance_km 是“直径/最大跨度”，算法内部自动 / 2。
+
+    outlet_df
+        可选网点经纬度表：
+        二级机构, 城市, 网点名称-正式, 经度, 纬度。
+        网点坐标为 GCJ-02；仅将归属信息写入 grids 和
+        grid_customer_detail，不参与专员格划分。
 
     返回
     ----
@@ -3667,7 +3948,7 @@ def run_satellite_grid_algorithm(
     )
     _print_timing(
         config,
-        "1/9 城市参数准备",
+        "1/10 城市参数准备",
         step_started_at,
         f"{len(city_params):,} 个城市",
     )
@@ -3681,7 +3962,7 @@ def run_satellite_grid_algorithm(
     )
     _print_timing(
         config,
-        "2/9 行政边界解析与坐标转换",
+        "2/10 行政边界解析与坐标转换",
         step_started_at,
         f"{len(admin_boundaries):,} 个行政区",
     )
@@ -3695,7 +3976,7 @@ def run_satellite_grid_algorithm(
     )
     _print_timing(
         config,
-        "3/9 已有网格解析与合并",
+        "3/10 已有网格解析与合并",
         step_started_at,
         f"{len(occupied_by_city):,} 个城市",
     )
@@ -3709,7 +3990,7 @@ def run_satellite_grid_algorithm(
     )
     _print_timing(
         config,
-        "4/9 构建行政 H3 空间池",
+        "4/10 构建行政 H3 空间池",
         step_started_at,
         f"{len(h3_pool):,} 个 H3",
     )
@@ -3740,7 +4021,7 @@ def run_satellite_grid_algorithm(
     )
     _print_timing(
         config,
-        "5/9 客户清洗、AOI、坐标及 H3 聚合",
+        "5/10 客户清洗、AOI、坐标及 H3 聚合",
         step_started_at,
         f"{len(customer_diagnostic):,} 条客户记录",
     )
@@ -3756,12 +4037,26 @@ def run_satellite_grid_algorithm(
     )
     _print_timing(
         config,
-        "6/9 BFS 划分与专员格 Geometry",
+        "6/10 BFS 划分与专员格 Geometry",
         step_started_at,
         f"{len(grids):,} 个成功专员格",
     )
 
-    # 7. 客户—专员格明细
+    # 7. 专员格归属城市内唯一 / 最近网点
+    step_started_at = time.perf_counter()
+    grids = attach_outlets_to_grids(
+        grids,
+        outlet_df,
+        cols,
+    )
+    _print_timing(
+        config,
+        "7/10 专员格归属网点",
+        step_started_at,
+        f"{len(grids):,} 个专员格",
+    )
+
+    # 8. 客户—专员格明细
     step_started_at = time.perf_counter()
     grid_customer_detail = build_grid_customer_detail(
         customer_diagnostic,
@@ -3774,12 +4069,12 @@ def run_satellite_grid_algorithm(
     validate_aoi_single_grid(grid_customer_detail)
     _print_timing(
         config,
-        "7/9 生成客户大表与 AOI 唯一归属校验",
+        "8/10 生成客户大表与 AOI 唯一归属校验",
         step_started_at,
         f"{len(grid_customer_detail):,} 行",
     )
 
-    # 8. 覆盖率
+    # 9. 覆盖率
     step_started_at = time.perf_counter()
     coverage = build_coverage_metrics(
         customer_diagnostic,
@@ -3788,11 +4083,11 @@ def run_satellite_grid_algorithm(
     )
     _print_timing(
         config,
-        "8/9 覆盖率漏斗",
+        "9/10 覆盖率漏斗",
         step_started_at,
     )
 
-    # 9. 守恒 / 一致性
+    # 10. 守恒 / 一致性
     step_started_at = time.perf_counter()
     validate_final_results(
         h3_pool,
@@ -3803,7 +4098,7 @@ def run_satellite_grid_algorithm(
     )
     _print_timing(
         config,
-        "9/9 最终守恒与连通性校验",
+        "10/10 最终守恒与连通性校验",
         step_started_at,
     )
     _print_timing(
@@ -3902,6 +4197,8 @@ RUN_FROM_FILES = False
 
 INPUT_FILES = {
     "customer": "./customers.csv",
+    # 网点表可选；不使用时改为 None。
+    "outlet": "./outlet_locations.csv",
     "admin": "./admin_boundaries.csv",
     "existing_grid": "./existing_basic_grids.csv",
     "fyp_threshold": "./city_fyp_threshold.csv",
@@ -3942,6 +4239,12 @@ def main() -> None:
     distance_df = load_table(
         INPUT_FILES["distance"]
     )
+    outlet_path = INPUT_FILES.get("outlet")
+    outlet_df = (
+        load_table(outlet_path)
+        if outlet_path
+        else None
+    )
 
     print("2/7 启动卫星网点划分算法...")
 
@@ -3951,6 +4254,7 @@ def main() -> None:
         existing_grid_df=existing_grid_df,
         fyp_threshold_df=fyp_threshold_df,
         distance_df=distance_df,
+        outlet_df=outlet_df,
     )
 
     print("3/7 网格划分完成。")

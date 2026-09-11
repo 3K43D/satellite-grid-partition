@@ -1,6 +1,6 @@
 # 卫星网点专员格自动划分
 
-基于行政街道边界、既有基础网格、客户位置、城市 FYP 门槛和距离门槛，使用 H3 与事务式 BFS 自动生成卫星网点专员格。
+基于行政街道边界、既有基础网格、客户位置、城市 FYP 门槛和距离门槛，使用 H3 与事务式 BFS 自动生成卫星网点专员格，并可按同城市唯一或最近原则归属到机构网点。
 
 当前版本：**V1.2**。
 
@@ -18,7 +18,9 @@
 - FYP 已达标但人数不足时继续扩张；半径或拓扑耗尽仍不达标则回滚。
 - 客户数按非空 `customer_id` 去重。`expected_fyp=0` 或为空的合法客户仍计人数；空值不贡献 FYP。
 - 非空 `aoi_id` 的客户统一使用该 AOI 的质心经纬度映射 H3，保证同一 AOI 最多进入一个专员格；空 `aoi_id` 客户仍各自使用客户坐标。
-- 默认在终端 / Notebook 输出 9 个主阶段耗时，仅用于性能定位，不写入或影响算法结果。
+- 专员格完成后才归属网点：同城市只有一个网点时直接归属；有多个时，选择距 Grid GCJ-02 几何质心最近的网点；同距离按网点名称升序。
+- 客户不单独计算网点，只继承成功专员格的网点；无成功专员格的客户网点字段为空。
+- 默认在终端 / Notebook 输出 10 个主阶段耗时，仅用于性能定位，不写入或影响算法结果。
 
 ## 仓库结构
 
@@ -58,6 +60,7 @@ pip install -r requirements.txt
 | 已有网格表 | `city`, `agent_net_id`, `basic_net_id`, `basic_net_geom` | GCJ-02 已占用空间，不参与新专员格划分 |
 | FYP 门槛表 | `city`, `target_expected_fyp` | 每个城市的最低 FYP |
 | 距离表 | `city`, `distance_km` | 专员格最大跨度/直径，算法自动除以 2 |
+| 网点经纬度表（可选） | `二级机构`, `城市`, `网点名称-正式`, `经度`, `纬度` | 网点是最小粒度，坐标为 GCJ-02；二级机构是省，仅输出，不参与匹配 |
 
 字段名不一致时，通过 `ColumnConfig` 映射，无需修改算法主体。
 
@@ -90,6 +93,7 @@ admin_df = pd.read_csv("data/admin_boundaries.csv")
 existing_grid_df = pd.read_csv("data/existing_basic_grids.csv")
 fyp_threshold_df = pd.read_csv("data/city_fyp_threshold.csv")
 distance_df = pd.read_csv("data/city_distance.csv")
+outlet_df = pd.read_csv("data/outlet_locations.csv")
 
 result = run_satellite_grid_algorithm(
     customer_df=customer_df,
@@ -97,6 +101,7 @@ result = run_satellite_grid_algorithm(
     existing_grid_df=existing_grid_df,
     fyp_threshold_df=fyp_threshold_df,
     distance_df=distance_df,
+    outlet_df=outlet_df,
     cols=ColumnConfig(),
     config=AlgorithmConfig(
         min_customer_count=50,
@@ -138,9 +143,10 @@ result.customer_diagnostic
 运行时会看到类似：
 
 ```text
-[TIMING] 4/9 构建行政 H3 空间池: 85.310s | 120,000 个 H3
-[TIMING] 5/9 客户清洗、AOI、坐标及 H3 聚合: 132.480s | 1,000,000 条客户记录
-[TIMING] 6/9 BFS 划分与专员格 Geometry: 916.200s | 500 个成功专员格
+[TIMING] 4/10 构建行政 H3 空间池: 85.310s | 120,000 个 H3
+[TIMING] 5/10 客户清洗、AOI、坐标及 H3 聚合: 132.480s | 1,000,000 条客户记录
+[TIMING] 6/10 BFS 划分与专员格 Geometry: 916.200s | 500 个成功专员格
+[TIMING] 7/10 专员格归属网点: 0.280s | 500 个专员格
 ```
 
 如需关闭计时输出，设置 `AlgorithmConfig(enable_timing=False)`。计时器不改变输入表、8 张输出表或专员格划分顺序。
@@ -167,6 +173,7 @@ result.customer_diagnostic
 ```bash
 python run_satellite_grid.py \
   --customer data/customers.csv \
+  --outlet data/outlet_locations.csv \
   --admin data/admin_boundaries.csv \
   --existing-grid data/existing_basic_grids.csv \
   --fyp-threshold data/city_fyp_threshold.csv \

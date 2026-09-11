@@ -17,7 +17,7 @@ Windows PowerShell 激活虚拟环境：
 .venv\Scripts\Activate.ps1
 ```
 
-算法默认在终端 / Notebook 打印 9 个主阶段和总耗时。
+算法默认在终端 / Notebook 打印 10 个主阶段和总耗时。
 这些计时仅用于判断慢在 H3 空间池、客户处理、BFS 还是结果组装，
 不参与任何业务计算。如需关闭：
 
@@ -72,12 +72,30 @@ config = AlgorithmConfig(
 - FYP 表：`city`, `target_expected_fyp`。
 - 距离表：`city`, `distance_km`。该距离是直径，实际种子覆盖半径为其一半。
 
+### 网点经纬度表（可选）
+
+| 字段 | 规则 |
+|---|---|
+| `二级机构` | 省级机构；随归属网点输出，不参与候选筛选 |
+| `城市` | 与 Grid 的 `city` 匹配 |
+| `网点名称-正式` | 同一城市内必须唯一；同距离时按该名称升序选择 |
+| `经度`, `纬度` | 网点点位的 GCJ-02 坐标；缺失或非法时直接报错 |
+
+归属发生在专员格划分完成之后，不影响 Seed、BFS、FYP、
+最低客户数或 AOI 结果。同城市仅一个网点时直接归属；有多个时，
+用 `grid_centroid_gcj02_lng/lat` 选择直线距离最近的网点。
+没有网点的城市保留空归属，不报错。
+
 ## 3. 首次试运行
 
 优先在 Notebook 中运行，便于逐表检查：
 
 ```python
+import pandas as pd
+
 from satellite_grid_partition_v1 import *
+
+outlet_df = pd.read_parquet("data/outlet_locations.parquet")
 
 config = AlgorithmConfig(
     h3_resolution=9,
@@ -89,11 +107,12 @@ config = AlgorithmConfig(
 )
 
 result = run_satellite_grid_algorithm(
-    customer_df,
-    admin_df,
-    existing_grid_df,
-    fyp_threshold_df,
-    distance_df,
+    customer_df=customer_df,
+    admin_df=admin_df,
+    existing_grid_df=existing_grid_df,
+    fyp_threshold_df=fyp_threshold_df,
+    distance_df=distance_df,
+    outlet_df=outlet_df,
     config=config,
 )
 ```
@@ -179,6 +198,7 @@ CSV 使用 UTF-8-SIG 编码，可直接用 Excel/WPS 打开。所有输出的解
 ```bash
 python run_satellite_grid.py \
   --customer data/customers.csv \
+  --outlet data/outlet_locations.csv \
   --admin data/admin_boundaries.csv \
   --existing-grid data/existing_basic_grids.csv \
   --fyp-threshold data/city_fyp_threshold.csv \
@@ -222,7 +242,12 @@ cp column_config.example.json column_config.json
   "threshold_city": "城市名称",
   "threshold_fyp": "最低FYP",
   "distance_city": "城市名称",
-  "distance_km": "最大跨度KM"
+  "distance_km": "最大跨度KM",
+  "outlet_secondary_org": "二级机构",
+  "outlet_city": "城市",
+  "outlet_name": "网点名称-正式",
+  "outlet_lng": "经度",
+  "outlet_lat": "纬度"
 }
 ```
 

@@ -35,10 +35,23 @@
 | `grid_centroid_gcj02_lng`, `grid_centroid_gcj02_lat` | 上述几何质心转换后的 GCJ-02 坐标 |
 | `grid_label_point_wgs84_lng`, `grid_label_point_wgs84_lat` | 保证位于 WGS84 专员格 Geometry 内的代表点 |
 | `grid_label_point_gcj02_lng`, `grid_label_point_gcj02_lat` | 保证位于 GCJ-02 专员格 Geometry 内的代表点，推荐用于高德标签或气泡 |
+| `assigned_secondary_org` | 归属网点对应的二级机构（当前业务中为省）；不参与网点筛选 |
+| `assigned_outlet_name` | 归属的正式网点名称；候选网点只取同城市记录 |
+| `assigned_outlet_lng`, `assigned_outlet_lat` | 归属网点的 GCJ-02 经纬度 |
+| `distance_to_assigned_outlet_km` | 专员格 GCJ-02 几何质心到归属网点的球面直线距离，单位千米 |
+| `outlet_assignment_method` | 网点归属方式，取值见下表 |
 
 推荐同时观察 `value_utilization` 与 `customer_count_utilization`：前者很高、后者接近 1，说明格子由少量高价值客户驱动；后者很高、前者接近 1，说明需要较多人才能满足 FYP。
 
 当 `build_grid_geometry=False` 时，边界、几何质心和内部代表点字段保留但值为空。
+
+`outlet_assignment_method`：
+
+| 值 | 解读 |
+|---|---|
+| `ONLY_OUTLET_IN_CITY` | 该城市只有一个候选网点，直接归属 |
+| `NEAREST_TO_GRID_CENTROID` | 该城市有多个候选网点，选择距专员格 GCJ-02 几何质心最近者；距离相同时按网点名称升序 |
+| `NO_OUTLET_IN_CITY` | 网点表中没有该城市的网点，归属字段保留为空且不报错 |
 
 ## 2. `h3_detail` / `02_h3_detail.csv`
 
@@ -255,6 +268,18 @@
 | `grid_customer_count`, `min_customer_count`, `customer_count_utilization` | 所属格客户数、人数门槛和达成倍数 |
 | `max_seed_distance_m`, `max_seed_radius_m`, `distance_diameter_km` | 所属格距离指标 |
 | `grid_expansion_layers`, `grid_status` | 所属格扩张层数和状态 |
+
+### 归属网点字段
+
+| 字段 | 含义 |
+|---|---|
+| `assigned_secondary_org` | 成功专员格归属网点对应的二级机构（省） |
+| `assigned_outlet_name` | 客户所属成功专员格的归属网点；客户本身不重复计算最近网点 |
+| `assigned_outlet_lng`, `assigned_outlet_lat` | 归属网点的 GCJ-02 经纬度 |
+| `distance_to_assigned_outlet_km` | 所属专员格 GCJ-02 几何质心到归属网点的球面直线距离，单位千米；同一专员格客户取值相同 |
+| `outlet_assignment_method` | 成功格客户继承 `ONLY_OUTLET_IN_CITY`、`NEAREST_TO_GRID_CENTROID` 或 `NO_OUTLET_IN_CITY`；没有成功专员格的客户为 `NO_SUCCESSFUL_GRID` |
+
+只有 `grids` 和 `grid_customer_detail` 包含网点归属字段。其他六张输出表不增加这些字段，且网点归属不参与专员格划分。
 
 表尾还保留客户诊断字段和原始输入字段，便于在一张表中完成客户、行政街道、H3、专员格和 FYP 的联合分析。
 
