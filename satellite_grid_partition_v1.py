@@ -121,7 +121,9 @@ import json
 import math
 import re
 import sys
+import time
 import warnings
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -137,11 +139,12 @@ except ImportError as exc:
     ) from exc
 
 try:
+    from shapely import covers as shapely_covers
+    from shapely import points as shapely_points
     from shapely import wkb, wkt
-    from shapely.geometry import Point, Polygon, MultiPolygon, mapping, shape
+    from shapely.geometry import Polygon, MultiPolygon, mapping, shape
     from shapely.ops import transform as shapely_transform
     from shapely.ops import unary_union
-    from shapely.prepared import prep
 except ImportError as exc:
     raise ImportError(
         "未安装 shapely。请先执行：pip install shapely"
@@ -244,6 +247,10 @@ class AlgorithmConfig:
     # 放在配置末尾以保持原有位置参数顺序兼容。
     restrict_to_admin_street: bool = True
 
+    # 是否在终端 / Notebook 输出各主阶段耗时。
+    # 仅记录墙上时间，不写入算法输出，不参与任何判断。
+    enable_timing: bool = True
+
 
 @dataclass
 class AlgorithmResult:
@@ -288,6 +295,35 @@ def _normalize_code(value: Any) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def _normalize_code_series(series: pd.Series) -> pd.Series:
+    """向量化版代码标准化。
+
+    在当前“标量字符串 / 数字 / 空值”数据契约下，与
+    ``series.map(_normalize_code)`` 的值及 object dtype 一致，
+    避免百万级数据上逐值调用 Python 函数。
+    """
+    return (
+        series.astype("string")
+        .str.strip()
+        .fillna("")
+        .astype(object)
+    )
+
+
+def _print_timing(
+    config: AlgorithmConfig,
+    label: str,
+    started_at: float,
+    detail: str = "",
+) -> None:
+    """输出单个主阶段耗时，不改变任何算法状态。"""
+    if not config.enable_timing:
+        return
+    suffix = f" | {detail}" if detail else ""
+    elapsed = time.perf_counter() - started_at
+    print(f"[TIMING] {label}: {elapsed:.3f}s{suffix}")
 
 
 def _safe_rate(numerator: float, denominator: float) -> float:
@@ -1265,35 +1301,73 @@ def build_admin_h3_pool(
     # 用于检测同一 H3 Center 被多个行政街道认领
     owner_map: Dict[Tuple[str, str], Tuple[str, str]] = {}
 
-    prepared_occupied: Dict[str, Any] = {}
-    for city, geom in occupied_by_city.items():
-        prepared_occupied[city] = (
-            prep(geom)
-            if geom is not None and not geom.is_empty
-            else None
-        )
-
     for row in admin_boundaries.itertuples(index=False):
         city = str(row.city)
         admin_code = str(row.admin_code)
         admin_name = str(row.admin_name)
         geom = row.geometry
 
-        prepared_admin = prep(geom)
+        candidate_cells = sorted(
+            h3_geometry_to_cells(
+                geom,
+                config.h3_resolution,
+            )
+        )
+        if not candidate_cells:
+            continue
 
-        candidate_cells = h3_geometry_to_cells(
-            geom,
-            config.h3_resolution,
+        # h3-py 当前的 cell_to_latlng 仍是标量接口，
+        # 但 Shapely Point 构造和 covers 可以在 GEOS 层批量执行。
+        # 候选 H3 顺序和 covers 业务口径均保持不变。
+        center_pairs = [
+            h3_cell_to_latlng(cell)
+            for cell in candidate_cells
+        ]
+        center_lats = np.fromiter(
+            (lat for lat, _lng in center_pairs),
+            dtype=np.float64,
+            count=len(center_pairs),
+        )
+        center_lngs = np.fromiter(
+            (lng for _lat, lng in center_pairs),
+            dtype=np.float64,
+            count=len(center_pairs),
+        )
+        center_points = shapely_points(center_lngs, center_lats)
+        inside_admin = np.asarray(
+            shapely_covers(geom, center_points),
+            dtype=bool,
         )
 
-        for cell in sorted(candidate_cells):
-            lat, lng = h3_cell_to_latlng(cell)
-            point = Point(lng, lat)
-            gcj_lng, gcj_lat = wgs84_to_gcj02(lng, lat)
+        existing_geom = occupied_by_city.get(city)
+        if existing_geom is not None and not existing_geom.is_empty:
+            inside_existing = np.asarray(
+                shapely_covers(existing_geom, center_points),
+                dtype=bool,
+            )
+        else:
+            inside_existing = np.zeros(
+                len(candidate_cells),
+                dtype=bool,
+            )
 
-            # 再次显式执行中心点归属，锁死业务口径
-            if not prepared_admin.covers(point):
+        for cell, lat, lng, is_inside, occupied in zip(
+            candidate_cells,
+            center_lats,
+            center_lngs,
+            inside_admin,
+            inside_existing,
+        ):
+            # 再次显式执行中心点归属，锁死业务口径。
+            if not bool(is_inside):
                 continue
+
+            # 为保持输出浮点值与原版一致，这里仍调用
+            # 原标量转换；GCJ 中心仅是输出字段，不参与空间判断。
+            gcj_lng, gcj_lat = wgs84_to_gcj02(
+                float(lng),
+                float(lat),
+            )
 
             key = (city, cell)
 
@@ -1329,11 +1403,6 @@ def build_admin_h3_pool(
 
             owner_map[key] = (admin_code, admin_name)
 
-            occupied = False
-            prepared_existing = prepared_occupied.get(city)
-            if prepared_existing is not None:
-                occupied = bool(prepared_existing.covers(point))
-
             records.append(
                 {
                     "city": city,
@@ -1346,7 +1415,7 @@ def build_admin_h3_pool(
                     "center_wgs84_lng": lng,
                     "center_gcj02_lat": gcj_lat,
                     "center_gcj02_lng": gcj_lng,
-                    "is_existing_occupied": occupied,
+                    "is_existing_occupied": bool(occupied),
                     "admin_restriction_enabled": bool(
                         config.restrict_to_admin_street
                     ),
@@ -1422,9 +1491,9 @@ def prepare_customers_and_attach_fyp(
         cust[cols.customer_city]
     )
 
-    cust["_customer_id_norm"] = cust[
-        cols.customer_id
-    ].map(_normalize_code)
+    cust["_customer_id_norm"] = _normalize_code_series(
+        cust[cols.customer_id]
+    )
     cust["_customer_id_available"] = (
         cust["_customer_id_norm"] != ""
     )
@@ -1441,9 +1510,9 @@ def prepare_customers_and_attach_fyp(
         cust[cols.customer_expected_fyp],
         errors="coerce",
     )
-    cust["_aoi_id_norm"] = cust[
-        cols.customer_aoi_id
-    ].map(_normalize_code)
+    cust["_aoi_id_norm"] = _normalize_code_series(
+        cust[cols.customer_aoi_id]
+    )
     cust["_has_aoi"] = cust["_aoi_id_norm"] != ""
     cust["_aoi_lng"] = pd.to_numeric(
         cust[cols.customer_aoi_lng],
@@ -1455,9 +1524,9 @@ def prepare_customers_and_attach_fyp(
     )
 
     if cols.customer_admin_code in cust.columns:
-        cust["_customer_admin_name_norm"] = cust[
-            cols.customer_admin_code
-        ].map(_normalize_code)
+        cust["_customer_admin_name_norm"] = _normalize_code_series(
+            cust[cols.customer_admin_code]
+        )
     else:
         cust["_customer_admin_name_norm"] = ""
 
@@ -1744,11 +1813,16 @@ def prepare_customers_and_attach_fyp(
     cust["_aoi_expected_fyp"] = np.nan
     if cust["_has_aoi"].any():
         aoi_member_rows = cust[cust["_has_aoi"]]
-        aoi_customer_count = aoi_member_rows.groupby(
-            "_aoi_id_norm",
-            sort=False,
-        )["_customer_id_norm"].transform(
-            lambda values: values[values != ""].nunique()
+        aoi_customer_count_by_id = (
+            aoi_member_rows.loc[
+                aoi_member_rows["_customer_id_norm"] != "",
+                ["_aoi_id_norm", "_customer_id_norm"],
+            ]
+            .groupby(
+                "_aoi_id_norm",
+                sort=False,
+            )["_customer_id_norm"]
+            .nunique()
         )
         aoi_expected_fyp = aoi_member_rows.groupby(
             "_aoi_id_norm",
@@ -1759,38 +1833,103 @@ def prepare_customers_and_attach_fyp(
         cust.loc[
             cust["_has_aoi"],
             "_aoi_customer_count",
-        ] = aoi_customer_count.astype("Int64")
+        ] = (
+            cust.loc[
+                cust["_has_aoi"],
+                "_aoi_id_norm",
+            ]
+            .map(aoi_customer_count_by_id)
+            .fillna(0)
+            .astype("Int64")
+        )
         cust.loc[
             cust["_has_aoi"],
             "_aoi_expected_fyp",
         ] = aoi_expected_fyp.astype(float)
 
-    # 分配坐标有效才做 H3。同一 AOI 的统一质心通过缓存只计算一次，
-    # 避免一个大型 AOI 的每位客户重复调用 H3。
-    h3_ids: List[Optional[str]] = []
-    h3_by_coordinate: Dict[Tuple[float, float], Optional[str]] = {}
-    for valid, lat, lng in zip(
-        cust["_valid_coordinate"].to_numpy(dtype=bool),
-        cust["_allocation_wgs84_lat"].to_numpy(dtype=np.float64),
-        cust["_allocation_wgs84_lng"].to_numpy(dtype=np.float64),
-    ):
-        if not bool(valid):
-            h3_ids.append(None)
-            continue
+    # 分配坐标有效才做 H3。如果坐标有重复（尤其是 AOI 客户），
+    # 先对唯一坐标计算 H3，再按原顺序映射回客户。不做任何
+    # 经纬度四舍五入，因此 H3 结果与原逐行缓存逻辑一致。
+    valid_coordinate_mask = cust["_valid_coordinate"].to_numpy(dtype=bool)
+    valid_positions = np.flatnonzero(valid_coordinate_mask)
+    h3_ids = np.empty(len(cust), dtype=object)
+    h3_ids[:] = None
 
-        coordinate_key = (float(lat), float(lng))
-        if coordinate_key not in h3_by_coordinate:
+    if valid_positions.size:
+        valid_coordinates = pd.DataFrame(
+            {
+                "lat": cust.loc[
+                    cust["_valid_coordinate"],
+                    "_allocation_wgs84_lat",
+                ].to_numpy(dtype=np.float64),
+                "lng": cust.loc[
+                    cust["_valid_coordinate"],
+                    "_allocation_wgs84_lng",
+                ].to_numpy(dtype=np.float64),
+            }
+        )
+
+        def coordinate_to_h3(lat: float, lng: float) -> Optional[str]:
             try:
-                h3_by_coordinate[coordinate_key] = h3_latlng_to_cell(
+                return h3_latlng_to_cell(
                     lat,
                     lng,
                     config.h3_resolution,
                 )
             except Exception:
-                h3_by_coordinate[coordinate_key] = None
-        h3_ids.append(h3_by_coordinate[coordinate_key])
+                return None
 
-    cust["_h3_id"] = h3_ids
+        duplicate_coordinate_mask = valid_coordinates.duplicated(
+            ["lat", "lng"],
+            keep=False,
+        )
+
+        if duplicate_coordinate_mask.any():
+            unique_coordinates = valid_coordinates.drop_duplicates(
+                ["lat", "lng"],
+                keep="first",
+            ).copy()
+        else:
+            unique_coordinates = valid_coordinates
+
+        # 重复坐标达到一定比例时，批量映射才会稳定快于
+        # 直接循环。重复很少时保持直接路径，避免额外 merge。
+        use_unique_coordinate_mapping = (
+            len(unique_coordinates) <= len(valid_coordinates) * 0.95
+        )
+
+        if use_unique_coordinate_mapping:
+            unique_coordinates["h3_id"] = [
+                coordinate_to_h3(lat, lng)
+                for lat, lng in zip(
+                    unique_coordinates["lat"].to_numpy(dtype=np.float64),
+                    unique_coordinates["lng"].to_numpy(dtype=np.float64),
+                )
+            ]
+            mapped_h3 = valid_coordinates.merge(
+                unique_coordinates,
+                on=["lat", "lng"],
+                how="left",
+                sort=False,
+                validate="many_to_one",
+            )["h3_id"].to_numpy(dtype=object)
+        else:
+            mapped_h3 = np.asarray(
+                [
+                    coordinate_to_h3(lat, lng)
+                    for lat, lng in zip(
+                        valid_coordinates["lat"].to_numpy(dtype=np.float64),
+                        valid_coordinates["lng"].to_numpy(dtype=np.float64),
+                    )
+                ],
+                dtype=object,
+            )
+
+        # merge 可能将全空映射列表示为 NaN，还原旧版 None 口径。
+        mapped_h3[pd.isna(mapped_h3)] = None
+        h3_ids[valid_positions] = mapped_h3
+
+    cust["_h3_id"] = h3_ids.tolist()
 
     pool_lookup = h3_pool[
         [
@@ -1822,9 +1961,9 @@ def prepare_customers_and_attach_fyp(
 
     if cols.customer_admin_code in cust.columns:
         # 与 H3 Center 根据行政区 Polygon 得到的行政街道名称比较
-        cust["_h3_admin_name_norm"] = cust[
-            "_h3_admin_name"
-        ].map(_normalize_code)
+        cust["_h3_admin_name_norm"] = _normalize_code_series(
+            cust["_h3_admin_name"]
+        )
 
         cust["_admin_consistent"] = (
             cust["_h3_in_admin_geometry"]
@@ -3435,10 +3574,10 @@ def validate_final_results(
             )
 
         visited = {seed}
-        queue = [seed]
+        queue = deque([seed])
 
         while queue:
-            cell = queue.pop(0)
+            cell = queue.popleft()
             for nb in h3_neighbors(cell):
                 if nb in cells and nb not in visited:
                     visited.add(nb)
@@ -3500,6 +3639,7 @@ def run_satellite_grid_algorithm(
 
     cols = cols or ColumnConfig()
     config = config or AlgorithmConfig()
+    algorithm_started_at = time.perf_counter()
 
     try:
         min_customer_count_value = float(config.min_customer_count)
@@ -3519,31 +3659,59 @@ def run_satellite_grid_algorithm(
     normalize_coordinate_system(config.input_coordinate_system)
 
     # 1. 城市参数
+    step_started_at = time.perf_counter()
     city_params = prepare_city_parameters(
         fyp_threshold_df,
         distance_df,
         cols,
     )
+    _print_timing(
+        config,
+        "1/9 城市参数准备",
+        step_started_at,
+        f"{len(city_params):,} 个城市",
+    )
 
     # 2. 行政街道 Geometry
+    step_started_at = time.perf_counter()
     admin_boundaries = prepare_admin_boundaries(
         admin_df,
         cols,
         config,
     )
+    _print_timing(
+        config,
+        "2/9 行政边界解析与坐标转换",
+        step_started_at,
+        f"{len(admin_boundaries):,} 个行政区",
+    )
 
     # 3. 已有基础网格 Union
+    step_started_at = time.perf_counter()
     occupied_by_city = prepare_existing_occupied_area(
         existing_grid_df,
         cols,
         config,
     )
+    _print_timing(
+        config,
+        "3/9 已有网格解析与合并",
+        step_started_at,
+        f"{len(occupied_by_city):,} 个城市",
+    )
 
     # 4. 行政街道铺满 H3 + 已有区域排除
+    step_started_at = time.perf_counter()
     h3_pool = build_admin_h3_pool(
         admin_boundaries,
         occupied_by_city,
         config,
+    )
+    _print_timing(
+        config,
+        "4/9 构建行政 H3 空间池",
+        step_started_at,
+        f"{len(h3_pool):,} 个 H3",
     )
 
     # 参数城市完整性检查
@@ -3561,6 +3729,7 @@ def run_satellite_grid_algorithm(
         )
 
     # 5. 客户 -> H3 + FYP 聚合
+    step_started_at = time.perf_counter()
     customer_diagnostic, h3_pool = (
         prepare_customers_and_attach_fyp(
             customer_df,
@@ -3569,8 +3738,15 @@ def run_satellite_grid_algorithm(
             config,
         )
     )
+    _print_timing(
+        config,
+        "5/9 客户清洗、AOI、坐标及 H3 聚合",
+        step_started_at,
+        f"{len(customer_diagnostic):,} 条客户记录",
+    )
 
     # 6. 主算法
+    step_started_at = time.perf_counter()
     grids, h3_detail, failed, abandoned = (
         run_partition_on_h3_pool(
             h3_pool,
@@ -3578,8 +3754,15 @@ def run_satellite_grid_algorithm(
             config,
         )
     )
+    _print_timing(
+        config,
+        "6/9 BFS 划分与专员格 Geometry",
+        step_started_at,
+        f"{len(grids):,} 个成功专员格",
+    )
 
     # 7. 客户—专员格明细
+    step_started_at = time.perf_counter()
     grid_customer_detail = build_grid_customer_detail(
         customer_diagnostic,
         grids,
@@ -3589,21 +3772,44 @@ def run_satellite_grid_algorithm(
 
     # 同一非空 AOI 必须只有一个 H3，且最多进入一个成功专员格。
     validate_aoi_single_grid(grid_customer_detail)
+    _print_timing(
+        config,
+        "7/9 生成客户大表与 AOI 唯一归属校验",
+        step_started_at,
+        f"{len(grid_customer_detail):,} 行",
+    )
 
     # 8. 覆盖率
+    step_started_at = time.perf_counter()
     coverage = build_coverage_metrics(
         customer_diagnostic,
         h3_detail,
         cols,
     )
+    _print_timing(
+        config,
+        "8/9 覆盖率漏斗",
+        step_started_at,
+    )
 
     # 9. 守恒 / 一致性
+    step_started_at = time.perf_counter()
     validate_final_results(
         h3_pool,
         grids,
         h3_detail,
         abandoned,
         config,
+    )
+    _print_timing(
+        config,
+        "9/9 最终守恒与连通性校验",
+        step_started_at,
+    )
+    _print_timing(
+        config,
+        "算法总耗时",
+        algorithm_started_at,
     )
 
     return AlgorithmResult(

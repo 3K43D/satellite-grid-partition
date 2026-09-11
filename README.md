@@ -18,6 +18,7 @@
 - FYP 已达标但人数不足时继续扩张；半径或拓扑耗尽仍不达标则回滚。
 - 客户数按非空 `customer_id` 去重。`expected_fyp=0` 或为空的合法客户仍计人数；空值不贡献 FYP。
 - 非空 `aoi_id` 的客户统一使用该 AOI 的质心经纬度映射 H3，保证同一 AOI 最多进入一个专员格；空 `aoi_id` 客户仍各自使用客户坐标。
+- 默认在终端 / Notebook 输出 9 个主阶段耗时，仅用于性能定位，不写入或影响算法结果。
 
 ## 仓库结构
 
@@ -133,6 +134,16 @@ result.coverage_metrics
 result.h3_pool
 result.customer_diagnostic
 ```
+
+运行时会看到类似：
+
+```text
+[TIMING] 4/9 构建行政 H3 空间池: 85.310s | 120,000 个 H3
+[TIMING] 5/9 客户清洗、AOI、坐标及 H3 聚合: 132.480s | 1,000,000 条客户记录
+[TIMING] 6/9 BFS 划分与专员格 Geometry: 916.200s | 500 个成功专员格
+```
+
+如需关闭计时输出，设置 `AlgorithmConfig(enable_timing=False)`。计时器不改变输入表、8 张输出表或专员格划分顺序。
 
 `result.grids` 同时输出专员格几何质心和内部代表点的 WGS84、GCJ-02 经纬度。几何质心适合分析，但可能落在凹形或 MultiPolygon 外；高德地图标注建议使用 `grid_label_point_gcj02_lng`、`grid_label_point_gcj02_lat`。
 

@@ -17,6 +17,16 @@ Windows PowerShell 激活虚拟环境：
 .venv\Scripts\Activate.ps1
 ```
 
+算法默认在终端 / Notebook 打印 9 个主阶段和总耗时。
+这些计时仅用于判断慢在 H3 空间池、客户处理、BFS 还是结果组装，
+不参与任何业务计算。如需关闭：
+
+```python
+config = AlgorithmConfig(
+    enable_timing=False,
+)
+```
+
 ## 2. 准备输入数据
 
 建议把数据放在本地 `data/` 目录。该目录已被 Git 忽略，避免客户信息和业务边界误传到远程仓库。
