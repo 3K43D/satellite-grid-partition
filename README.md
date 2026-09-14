@@ -1,6 +1,6 @@
 # 卫星网点专员格自动划分
 
-基于行政街道边界、既有基础网格、客户位置、城市 FYP 门槛和距离门槛，使用 H3 与事务式 BFS 自动生成卫星网点专员格，并可按同城市唯一或最近原则归属到机构网点。
+基于行政街道边界、既有基础网格、客户位置、城市 FYP 门槛和距离门槛，使用 H3 与事务式 BFS 自动生成卫星网点专员格，并可按同城市最近职场坐标归属到机构网点。
 
 当前版本：**V1.2**。
 
@@ -18,7 +18,7 @@
 - FYP 已达标但人数不足时继续扩张；半径或拓扑耗尽仍不达标则回滚。
 - 客户数按非空 `customer_id` 去重。`expected_fyp=0` 或为空的合法客户仍计人数；空值不贡献 FYP。
 - 非空 `aoi_id` 的客户统一使用该 AOI 的质心经纬度映射 H3，保证同一 AOI 最多进入一个专员格；空 `aoi_id` 客户仍各自使用客户坐标。
-- 专员格完成后才归属网点：同城市只有一个网点时直接归属；有多个时，选择距 Grid GCJ-02 几何质心最近的网点；同距离按网点名称升序。
+- 专员格完成后才归属网点：网点表每行代表一个职场坐标，同一网点允许有多个职场；选择距 Grid GCJ-02 几何质心最近的一行，同距离按网点名称、原始行顺序依次选择。
 - 客户不单独计算网点，只继承成功专员格的网点；无成功专员格的客户网点字段为空。
 - 默认在终端 / Notebook 输出 10 个主阶段耗时，仅用于性能定位，不写入或影响算法结果。
 
@@ -60,7 +60,7 @@ pip install -r requirements.txt
 | 已有网格表 | `city`, `agent_net_id`, `basic_net_id`, `basic_net_geom` | GCJ-02 已占用空间，不参与新专员格划分 |
 | FYP 门槛表 | `city`, `target_expected_fyp` | 每个城市的最低 FYP |
 | 距离表 | `city`, `distance_km` | 专员格最大跨度/直径，算法自动除以 2 |
-| 网点经纬度表（可选） | `二级机构`, `城市`, `网点名称-正式`, `经度`, `纬度` | 网点是最小粒度，坐标为 GCJ-02；二级机构是省，仅输出，不参与匹配 |
+| 网点经纬度表（可选） | `二级机构`, `城市`, `网点名称-正式`, `经度`, `纬度` | 每行是一个 GCJ-02 职场坐标；同一网点可以有多行；二级机构是省，仅输出，不参与匹配 |
 
 字段名不一致时，通过 `ColumnConfig` 映射，无需修改算法主体。
 
@@ -86,6 +86,7 @@ from satellite_grid_partition_v1 import (
     ColumnConfig,
     run_satellite_grid_algorithm,
     save_result_csv,
+    save_result_parquet,
 )
 
 customer_df = pd.read_csv("data/customers.csv")
@@ -111,7 +112,10 @@ result = run_satellite_grid_algorithm(
     ),
 )
 
-save_result_csv(result, "satellite_grid_output")
+save_result_parquet(result, "satellite_grid_output")
+
+# 如需 Excel/WPS 更方便查看的 CSV，仍可使用：
+# save_result_csv(result, "satellite_grid_output_csv")
 ```
 
 需要允许同一城市内跨行政街道时，只改这一项：
@@ -157,16 +161,18 @@ result.customer_diagnostic
 
 | 文件 | DataFrame | 用途 |
 |---|---|---|
-| `01_grid_level.csv` | `result.grids` | 成功专员格主表 |
-| `02_h3_detail.csv` | `result.h3_detail` | H3 到专员格的分配明细 |
-| `03_failed_seeds.csv` | `result.failed_seeds` | 失败尝试及未达标原因 |
-| `04_abandoned_h3.csv` | `result.abandoned_h3` | 最终未进入成功专员格的合法 H3 |
-| `05_coverage_metrics.csv` | `result.coverage_metrics` | 城市级客户与 FYP 覆盖率漏斗 |
-| `06_h3_pool_debug.csv` | `result.h3_pool` | 算法运行前的完整 H3 中间池 |
-| `07_customer_diagnostic.csv` | `result.customer_diagnostic` | 客户映射与资格诊断 |
-| `08_grid_customer_detail.csv` | `result.grid_customer_detail` | 客户维度分析大表，建议作为主要分析入口 |
+| `01_grid_level.parquet` | `result.grids` | 成功专员格主表 |
+| `02_h3_detail.parquet` | `result.h3_detail` | H3 到专员格的分配明细 |
+| `03_failed_seeds.parquet` | `result.failed_seeds` | 失败尝试及未达标原因 |
+| `04_abandoned_h3.parquet` | `result.abandoned_h3` | 最终未进入成功专员格的合法 H3 |
+| `05_coverage_metrics.parquet` | `result.coverage_metrics` | 城市级客户与 FYP 覆盖率漏斗 |
+| `06_h3_pool_debug.parquet` | `result.h3_pool` | 算法运行前的完整 H3 中间池 |
+| `07_customer_diagnostic.parquet` | `result.customer_diagnostic` | 客户映射与资格诊断 |
+| `08_grid_customer_detail.parquet` | `result.grid_customer_detail` | 客户维度分析大表，建议作为主要分析入口 |
 
 每张表的字段、公式和业务解读见 [输出数据字典](docs/output-data-dictionary.md)。完整运行步骤和问题排查见 [操作指引](docs/operation-guide.md)。
+
+命令行和直接运行主文件默认保存 Snappy 压缩的 Parquet。需要 CSV 时，可在命令行增加 `--output-format csv`，或在 Notebook 中调用 `save_result_csv`。
 
 ## Terminal 运行与自定义列名
 
@@ -198,11 +204,11 @@ export AMAP_JS_API_KEY='你的 Web JS API Key'
 export AMAP_SECURITY_JS_CODE='你的安全密钥'
 
 python amap_grid_viewer.py \
-  --grid-file satellite_grid_output/01_grid_level.csv \
+  --grid-file satellite_grid_output/01_grid_level.parquet \
   --list-grids
 
 python amap_grid_viewer.py \
-  --grid-file satellite_grid_output/01_grid_level.csv \
+  --grid-file satellite_grid_output/01_grid_level.parquet \
   --grid-id '要展示的grid_id'
 
 python -m http.server 8000

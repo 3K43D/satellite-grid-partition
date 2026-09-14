@@ -12,6 +12,7 @@ from satellite_grid_partition_v1 import (
     load_table,
     run_satellite_grid_algorithm,
     save_result_csv,
+    save_result_parquet,
 )
 
 
@@ -44,6 +45,12 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default="satellite_grid_output",
         help="输出目录，默认 satellite_grid_output",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=["parquet", "csv"],
+        default="parquet",
+        help="输出格式，默认 parquet；需要 CSV 时指定 csv",
     )
     parser.add_argument(
         "--column-config",
@@ -157,8 +164,12 @@ def main() -> None:
     print(f"失败 Seed：{len(result.failed_seeds):,}")
     print(f"废弃 H3：{len(result.abandoned_h3):,}")
 
-    print("3/4 保存 CSV...")
-    save_result_csv(result, args.output_dir)
+    if args.output_format == "parquet":
+        print("3/4 保存 Parquet...")
+        save_result_parquet(result, args.output_dir)
+    else:
+        print("3/4 保存 CSV...")
+        save_result_csv(result, args.output_dir)
     print(result.coverage_metrics.to_string(index=False))
 
     print(f"4/4 完成：{Path(args.output_dir).resolve()}")

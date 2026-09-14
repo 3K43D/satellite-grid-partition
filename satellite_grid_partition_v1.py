@@ -22,7 +22,7 @@
    - 同时达到城市 target_expected_fyp 与最低客户数后立即提交；
    - 失败事务回滚，失败 Seed 仅禁止再次作为 Seed，但仍可被其他网格吸收；
 6. 主循环结束后，将剩余 H3 作为孤岛进行单向吸附；
-7. 划分完成后按城市将成功专员格归属到唯一或最近网点，
+7. 划分完成后按城市将成功专员格归属到唯一或最近职场坐标行，
    客户继承所属成功专员格的网点；
 8. 输出 Grid、H3 明细、客户—专员格明细、失败 Seed、废弃 H3、
    覆盖率漏斗、H3 中间池等结果。
@@ -60,9 +60,9 @@ M. 客户数按非空 customer_id 去重计算；expected_fyp=0 仍计入客户�
    expected_fyp 为空的合法客户也计入客户数，但不贡献 FYP。
 N. 同一非空 AOI_ID 必须使用一致的质心经纬度并统一映射到一个 H3，
    因此最多只能进入一个专员格；AOI_ID 为空的客户互不归组。
-O. 网点坐标使用 GCJ-02。候选网点只按城市筛选；城市内只有一个网点时
-   直接归属，有多个时选择距 Grid GCJ-02 几何质心最近的网点，距离相同
-   时按网点名称升序；二级机构为省，只随结果输出。
+O. 网点坐标使用 GCJ-02，每行代表一个职场坐标，同一网点允许有多行。
+   候选行只按城市筛选；选择距 Grid GCJ-02 几何质心最近的一行，距离
+   相同时按网点名称、输入原始行顺序依次选择；二级机构为省，只随结果输出。
 
 建议安装
 --------
@@ -2864,6 +2864,7 @@ def prepare_outlets(
     """
     standard_columns = [
         "_outlet_city_norm",
+        "_outlet_row_order",
         "assigned_secondary_org",
         "assigned_outlet_name",
         "assigned_outlet_lng",
@@ -2882,6 +2883,9 @@ def prepare_outlets(
     _require_columns(outlet_df, required, "网点经纬度表")
 
     work = outlet_df[required].copy()
+    # 同一网点允许有多个职场坐标。原始行号只用于距离、名称
+    # 都相同时提供稳定的最终排序，不作为业务字段输出。
+    work["_outlet_row_order"] = np.arange(len(work), dtype=np.int64)
     work["_outlet_city_norm"] = _normalize_code_series(
         work[cols.outlet_city]
     )
@@ -2927,23 +2931,12 @@ def prepare_outlets(
             f"示例：\n{examples}"
         )
 
-    duplicated_outlet = work.duplicated(
-        ["_outlet_city_norm", "assigned_outlet_name"],
-        keep=False,
-    )
-    if duplicated_outlet.any():
-        examples = work.loc[
-            duplicated_outlet,
-            standard_columns,
-        ].head(20)
-        raise ValueError(
-            "网点经纬度表要求每个城市下的‘网点名称-正式’"
-            "唯一，但检测到重复。\n"
-            f"示例：\n{examples}"
-        )
-
     return work[standard_columns].sort_values(
-        ["_outlet_city_norm", "assigned_outlet_name"],
+        [
+            "_outlet_city_norm",
+            "assigned_outlet_name",
+            "_outlet_row_order",
+        ],
         kind="mergesort",
     ).reset_index(drop=True)
 
@@ -2953,7 +2946,7 @@ def attach_outlets_to_grids(
     outlet_df: Optional[pd.DataFrame],
     cols: ColumnConfig,
 ) -> pd.DataFrame:
-    """按城市将每个成功 Grid 归属到唯一或最近网点。"""
+    """按城市将每个成功 Grid 归属到唯一或最近职场坐标行。"""
     # 即使本次没有成功 Grid，也先校验用户传入的网点表，
     # 避免非法坐标因输出为空而被静默忽略。
     outlets = prepare_outlets(outlet_df, cols)
@@ -3031,11 +3024,17 @@ def attach_outlets_to_grids(
                     (
                         float(distance_km),
                         str(candidate["assigned_outlet_name"]),
+                        int(candidate["_outlet_row_order"]),
                         int(candidate_index),
                     )
                 )
 
-            distance_km, _name, winner_index = min(ranked_candidates)
+            (
+                distance_km,
+                _name,
+                _row_order,
+                winner_index,
+            ) = min(ranked_candidates)
             winner = candidates.iloc[winner_index]
             method = "NEAREST_TO_GRID_CENTROID"
 
@@ -4042,7 +4041,7 @@ def run_satellite_grid_algorithm(
         f"{len(grids):,} 个成功专员格",
     )
 
-    # 7. 专员格归属城市内唯一 / 最近网点
+    # 7. 专员格归属城市内唯一 / 最近职场坐标行
     step_started_at = time.perf_counter()
     grids = attach_outlets_to_grids(
         grids,
@@ -4184,6 +4183,45 @@ def save_result_csv(
         )
 
 
+def save_result_parquet(
+    result: AlgorithmResult,
+    output_dir: str | Path,
+    compression: str = "snappy",
+) -> None:
+    """将 8 张结果表保存为 Parquet，默认使用 Snappy 压缩。"""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    tables = {
+        "01_grid_level.parquet": result.grids,
+        "02_h3_detail.parquet": result.h3_detail,
+        "03_failed_seeds.parquet": result.failed_seeds,
+        "04_abandoned_h3.parquet": result.abandoned_h3,
+        "05_coverage_metrics.parquet": result.coverage_metrics,
+        "06_h3_pool_debug.parquet": result.h3_pool,
+        "07_customer_diagnostic.parquet": result.customer_diagnostic,
+        "08_grid_customer_detail.parquet": result.grid_customer_detail,
+    }
+
+    for filename, df in tables.items():
+        try:
+            df.to_parquet(
+                output_dir / filename,
+                index=False,
+                engine="pyarrow",
+                compression=compression,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"保存 Parquet 失败：{filename}。"
+                "请检查 pyarrow 是否安装，以及输入表是否包含"
+                "无法序列化的混合对象列。"
+            ) from exc
+
+
 # ============================================================
 # 15. 可选：直接从文件运行
 # ============================================================
@@ -4206,6 +4244,7 @@ INPUT_FILES = {
 }
 
 OUTPUT_DIR = "./satellite_grid_output"
+OUTPUT_FORMAT = "parquet"
 
 
 def main() -> None:
@@ -4275,11 +4314,17 @@ def main() -> None:
     if not result.coverage_metrics.empty:
         print(result.coverage_metrics.to_string(index=False))
 
-    print("5/7 保存结果 CSV...")
-    save_result_csv(
-        result,
-        OUTPUT_DIR,
-    )
+    output_format = str(OUTPUT_FORMAT).strip().lower()
+    if output_format == "parquet":
+        print("5/7 保存结果 Parquet...")
+        save_result_parquet(result, OUTPUT_DIR)
+    elif output_format == "csv":
+        print("5/7 保存结果 CSV...")
+        save_result_csv(result, OUTPUT_DIR)
+    else:
+        raise ValueError(
+            "OUTPUT_FORMAT 仅支持 'parquet' 或 'csv'。"
+        )
 
     print("6/7 守恒与连通性校验已通过。")
 

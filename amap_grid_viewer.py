@@ -17,9 +17,13 @@ from satellite_grid_partition_v1 import wgs84_to_gcj02
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="从 01_grid_level.csv 生成一个专员格的高德地图页面。",
+        description="从 Grid 输出表生成一个专员格的高德地图页面。",
     )
-    parser.add_argument("--grid-file", required=True, help="Grid CSV/XLSX 路径")
+    parser.add_argument(
+        "--grid-file",
+        required=True,
+        help="Grid Parquet/CSV/XLSX 路径",
+    )
     parser.add_argument("--grid-id", help="要展示的 grid_id")
     parser.add_argument(
         "--list-grids",
@@ -53,9 +57,11 @@ def load_grid_table(path: str) -> pd.DataFrame:
     suffix = source.suffix.lower()
     if suffix == ".csv":
         return pd.read_csv(source)
+    if suffix == ".parquet":
+        return pd.read_parquet(source)
     if suffix in {".xlsx", ".xls"}:
         return pd.read_excel(source)
-    raise ValueError("地图模块目前支持 CSV、XLSX 或 XLS。")
+    raise ValueError("地图模块目前支持 Parquet、CSV、XLSX 或 XLS。")
 
 
 def convert_geojson_wgs84_to_gcj02(geometry: dict) -> dict:
@@ -270,4 +276,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

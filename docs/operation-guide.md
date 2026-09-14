@@ -78,12 +78,14 @@ config = AlgorithmConfig(
 |---|---|
 | `二级机构` | 省级机构；随归属网点输出，不参与候选筛选 |
 | `城市` | 与 Grid 的 `city` 匹配 |
-| `网点名称-正式` | 同一城市内必须唯一；同距离时按该名称升序选择 |
+| `网点名称-正式` | 同一网点可因多个职场坐标出现多行；同距离时按该名称升序选择 |
 | `经度`, `纬度` | 网点点位的 GCJ-02 坐标；缺失或非法时直接报错 |
 
 归属发生在专员格划分完成之后，不影响 Seed、BFS、FYP、
-最低客户数或 AOI 结果。同城市仅一个网点时直接归属；有多个时，
-用 `grid_centroid_gcj02_lng/lat` 选择直线距离最近的网点。
+最低客户数或 AOI 结果。网点表每一行代表一个职场坐标；同一网点
+可有多个坐标行。算法用 `grid_centroid_gcj02_lng/lat` 与同城市
+每一行计算距离，选择最近的一行；距离相同时先按网点名称升序，
+名称也相同时按输入表原始行顺序。
 没有网点的城市保留空归属，不报错。
 
 ## 3. 首次试运行
@@ -188,10 +190,10 @@ grid_analysis = (
 ## 5. 保存输出
 
 ```python
-save_result_csv(result, "satellite_grid_output")
+save_result_parquet(result, "satellite_grid_output")
 ```
 
-CSV 使用 UTF-8-SIG 编码，可直接用 Excel/WPS 打开。所有输出的解释见 `docs/output-data-dictionary.md`。
+Parquet 默认使用 Snappy 压缩，通常比 CSV 写入更快、文件更小，读取时使用 `pd.read_parquet(...)`。如需 CSV，仍可调用 `save_result_csv(result, "satellite_grid_output_csv")`；CSV 使用 UTF-8-SIG 编码，可直接用 Excel/WPS 打开。所有输出的解释见 `docs/output-data-dictionary.md`。
 
 ## 6. 在 Terminal 中运行
 
@@ -209,6 +211,8 @@ python run_satellite_grid.py \
 ```
 
 使用 `python run_satellite_grid.py --help` 查看全部参数。
+
+命令行默认输出 Parquet。如需输出 CSV，在命令中增加 `--output-format csv`。
 
 ### 输入列名不一致
 
@@ -291,7 +295,7 @@ export AMAP_SECURITY_JS_CODE='你的安全密钥'
 
 ```bash
 python amap_grid_viewer.py \
-  --grid-file satellite_grid_output/01_grid_level.csv \
+  --grid-file satellite_grid_output/01_grid_level.parquet \
   --list-grids
 ```
 
@@ -299,7 +303,7 @@ python amap_grid_viewer.py \
 
 ```bash
 python amap_grid_viewer.py \
-  --grid-file satellite_grid_output/01_grid_level.csv \
+  --grid-file satellite_grid_output/01_grid_level.parquet \
   --grid-id '上海市_310120_G000001' \
   --output amap_grid_preview.html
 ```

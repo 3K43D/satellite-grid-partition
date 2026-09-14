@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import pandas as pd
 
 import satellite_grid_partition_v1 as sg
+from amap_grid_viewer import load_grid_table
 from test_admin_street_switch import _make_inputs
 
 
@@ -118,6 +122,95 @@ def test_only_outlet_and_missing_city() -> None:
     }
 
 
+def test_same_outlet_can_have_multiple_workplaces() -> None:
+    # 同名网点允许有多个职场坐标，并选择离 Grid 质心最近的一行。
+    outlets = pd.DataFrame(
+        [
+            {
+                "二级机构": "上海",
+                "城市": "上海",
+                "网点名称-正式": "多职场网点",
+                "经度": 120.00,
+                "纬度": 30.00,
+            },
+            {
+                "二级机构": "上海",
+                "城市": "上海",
+                "网点名称-正式": "多职场网点",
+                "经度": 121.47,
+                "纬度": 31.23,
+            },
+        ]
+    )
+    result = _run(outlets)
+    grid = result.grids.iloc[0]
+    assert grid["assigned_outlet_name"] == "多职场网点"
+    assert float(grid["assigned_outlet_lng"]) == 121.47
+    assert float(grid["assigned_outlet_lat"]) == 31.23
+    assert grid["outlet_assignment_method"] == (
+        "NEAREST_TO_GRID_CENTROID"
+    )
+
+    # 距离与名称都相同，使用输入表原始行顺序作为最终稳定规则。
+    exact_tie = pd.DataFrame(
+        [
+            {
+                "二级机构": "原始第一行",
+                "城市": "上海",
+                "网点名称-正式": "同名网点",
+                "经度": 121.47,
+                "纬度": 31.23,
+            },
+            {
+                "二级机构": "原始第二行",
+                "城市": "上海",
+                "网点名称-正式": "同名网点",
+                "经度": 121.47,
+                "纬度": 31.23,
+            },
+        ]
+    )
+    tied_result = _run(exact_tie)
+    assert tied_result.grids.iloc[0]["assigned_secondary_org"] == (
+        "原始第一行"
+    )
+
+
+def test_parquet_is_default_ready_and_csv_is_retained() -> None:
+    outlets = pd.DataFrame(
+        [
+            {
+                "二级机构": "上海",
+                "城市": "上海",
+                "网点名称-正式": "测试网点",
+                "经度": 121.47,
+                "纬度": 31.23,
+            }
+        ]
+    )
+    result = _run(outlets)
+
+    with TemporaryDirectory() as temp_dir:
+        parquet_dir = Path(temp_dir) / "parquet"
+        csv_dir = Path(temp_dir) / "csv"
+        sg.save_result_parquet(result, parquet_dir)
+        sg.save_result_csv(result, csv_dir)
+
+        parquet_files = sorted(parquet_dir.glob("*.parquet"))
+        csv_files = sorted(csv_dir.glob("*.csv"))
+        assert len(parquet_files) == 8
+        assert len(csv_files) == 8
+
+        customer_detail = pd.read_parquet(
+            parquet_dir / "08_grid_customer_detail.parquet"
+        )
+        assert len(customer_detail) == len(result.grid_customer_detail)
+        grid_table = load_grid_table(
+            str(parquet_dir / "01_grid_level.parquet")
+        )
+        assert len(grid_table) == len(result.grids)
+
+
 def test_invalid_outlet_coordinate_rejected() -> None:
     invalid_outlet = pd.DataFrame(
         [
@@ -141,5 +234,7 @@ def test_invalid_outlet_coordinate_rejected() -> None:
 if __name__ == "__main__":
     test_outlet_assignment_and_customer_inheritance()
     test_only_outlet_and_missing_city()
+    test_same_outlet_can_have_multiple_workplaces()
+    test_parquet_is_default_ready_and_csv_is_retained()
     test_invalid_outlet_coordinate_rejected()
     print("网点归属测试通过。")

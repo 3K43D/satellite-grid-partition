@@ -1,8 +1,8 @@
 # 输出数据字典与指标解读
 
-算法通过 `AlgorithmResult` 返回 8 张 DataFrame。保存 CSV 后与下列文件一一对应。
+算法通过 `AlgorithmResult` 返回 8 张 DataFrame。默认保存为 Parquet；如调用 `save_result_csv`，文件名主干相同、扩展名改为 `.csv`。
 
-## 1. `grids` / `01_grid_level.csv`
+## 1. `grids` / `01_grid_level.parquet`
 
 一行代表一个成功专员格。
 
@@ -36,8 +36,8 @@
 | `grid_label_point_wgs84_lng`, `grid_label_point_wgs84_lat` | 保证位于 WGS84 专员格 Geometry 内的代表点 |
 | `grid_label_point_gcj02_lng`, `grid_label_point_gcj02_lat` | 保证位于 GCJ-02 专员格 Geometry 内的代表点，推荐用于高德标签或气泡 |
 | `assigned_secondary_org` | 归属网点对应的二级机构（当前业务中为省）；不参与网点筛选 |
-| `assigned_outlet_name` | 归属的正式网点名称；候选网点只取同城市记录 |
-| `assigned_outlet_lng`, `assigned_outlet_lat` | 归属网点的 GCJ-02 经纬度 |
+| `assigned_outlet_name` | 归属的正式网点名称；候选职场坐标行只取同城市记录，同一网点允许有多行 |
+| `assigned_outlet_lng`, `assigned_outlet_lat` | 最终选中职场行的 GCJ-02 经纬度 |
 | `distance_to_assigned_outlet_km` | 专员格 GCJ-02 几何质心到归属网点的球面直线距离，单位千米 |
 | `outlet_assignment_method` | 网点归属方式，取值见下表 |
 
@@ -49,11 +49,11 @@
 
 | 值 | 解读 |
 |---|---|
-| `ONLY_OUTLET_IN_CITY` | 该城市只有一个候选网点，直接归属 |
-| `NEAREST_TO_GRID_CENTROID` | 该城市有多个候选网点，选择距专员格 GCJ-02 几何质心最近者；距离相同时按网点名称升序 |
+| `ONLY_OUTLET_IN_CITY` | 该城市只有一个候选职场坐标行，直接归属 |
+| `NEAREST_TO_GRID_CENTROID` | 该城市有多个候选职场坐标行，选择距专员格 GCJ-02 几何质心最近者；距离相同时按网点名称、输入原始行顺序依次选择 |
 | `NO_OUTLET_IN_CITY` | 网点表中没有该城市的网点，归属字段保留为空且不报错 |
 
-## 2. `h3_detail` / `02_h3_detail.csv`
+## 2. `h3_detail` / `02_h3_detail.parquet`
 
 一行代表一个已进入成功专员格的 H3。
 
@@ -72,7 +72,7 @@
 
 该表适合地图渲染、检查空间连续性，以及分析一个专员格由哪些 H3 构成。
 
-## 3. `failed_seeds` / `03_failed_seeds.csv`
+## 3. `failed_seeds` / `03_failed_seeds.parquet`
 
 一行代表一次失败并回滚的种子尝试，不代表一个永久失败的客户或 H3。同一片区域可能由不同种子尝试多次。
 
@@ -102,7 +102,7 @@
 | `CUSTOMER_COUNT_NOT_REACHED` | FYP 可达标，但人数不足 |
 | `FYP_AND_CUSTOMER_COUNT_NOT_REACHED` | 两个门槛都不足 |
 
-## 4. `abandoned_h3` / `04_abandoned_h3.csv`
+## 4. `abandoned_h3` / `04_abandoned_h3.parquet`
 
 一行代表最终未进入任何成功专员格的合法 H3。
 
@@ -120,7 +120,7 @@
 
 废弃不一定是数据错误：它可能是零客户空间、无法在半径内满足双门槛，或无法邻接吸附到已有成功格。
 
-## 5. `coverage_metrics` / `05_coverage_metrics.csv`
+## 5. `coverage_metrics` / `05_coverage_metrics.parquet`
 
 一行代表一个城市的客户和 FYP 覆盖率漏斗。
 
@@ -156,7 +156,7 @@
 - `algorithm_candidate_*` 已排除前置数据和业务资格问题，更接近算法成格效果。
 - 分母为 0 时比率返回空值，而不是 0。
 
-## 6. `h3_pool` / `06_h3_pool_debug.csv`
+## 6. `h3_pool` / `06_h3_pool_debug.parquet`
 
 完整行政空间 H3 中间池，包括有客户和无客户 H3，主要用于研发调试。
 
@@ -175,7 +175,7 @@
 
 该表中的 H3 数量通常远大于有客户 H3 数量，因为算法保留零客户 H3 以维持空间拓扑连续。
 
-## 7. `customer_diagnostic` / `07_customer_diagnostic.csv`
+## 7. `customer_diagnostic` / `07_customer_diagnostic.parquet`
 
 一行对应一条去重后的客户记录，保留原始字段并增加诊断字段。
 
@@ -211,7 +211,7 @@
 
 原始客户表的其他字段也会继续保留。该表适合排查“为什么某客户未参与算法”，不应直接用 `_h3_id` 判断最终是否拥有专员格。
 
-## 8. `grid_customer_detail` / `08_grid_customer_detail.csv`
+## 8. `grid_customer_detail` / `08_grid_customer_detail.parquet`
 
 客户维度最终分析大表，一行对应一条去重后的客户记录。它连接客户诊断、H3 分配和 Grid 指标，是日常分析的首选输出。
 
@@ -275,7 +275,7 @@
 |---|---|
 | `assigned_secondary_org` | 成功专员格归属网点对应的二级机构（省） |
 | `assigned_outlet_name` | 客户所属成功专员格的归属网点；客户本身不重复计算最近网点 |
-| `assigned_outlet_lng`, `assigned_outlet_lat` | 归属网点的 GCJ-02 经纬度 |
+| `assigned_outlet_lng`, `assigned_outlet_lat` | 最终选中职场行的 GCJ-02 经纬度 |
 | `distance_to_assigned_outlet_km` | 所属专员格 GCJ-02 几何质心到归属网点的球面直线距离，单位千米；同一专员格客户取值相同 |
 | `outlet_assignment_method` | 成功格客户继承 `ONLY_OUTLET_IN_CITY`、`NEAREST_TO_GRID_CENTROID` 或 `NO_OUTLET_IN_CITY`；没有成功专员格的客户为 `NO_SUCCESSFUL_GRID` |
 
