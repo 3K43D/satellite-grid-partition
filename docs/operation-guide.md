@@ -106,6 +106,7 @@ config = AlgorithmConfig(
     restrict_to_admin_street=True,
     require_customer_admin_match=True,
     build_grid_geometry=True,
+    coordinate_transform_chunk_size=500_000,
 )
 
 result = run_satellite_grid_algorithm(
@@ -193,7 +194,7 @@ grid_analysis = (
 save_result_parquet(result, "satellite_grid_output")
 ```
 
-Parquet 默认使用 Snappy 压缩，通常比 CSV 写入更快、文件更小，读取时使用 `pd.read_parquet(...)`。如需 CSV，仍可调用 `save_result_csv(result, "satellite_grid_output_csv")`；CSV 使用 UTF-8-SIG 编码，可直接用 Excel/WPS 打开。所有输出的解释见 `docs/output-data-dictionary.md`。
+Parquet 默认使用 Snappy 压缩，通常比 CSV 写入更快、文件更小，读取时使用 `pd.read_parquet(...)`。如原始扩展字段是 Parquet 不能直接序列化的混合 `object` 列，程序会仅将实际报错的列在写出副本中转成字符串，并警告具体文件和字段；内存中的 `result` 不变。如需 CSV，仍可调用 `save_result_csv(result, "satellite_grid_output_csv")`；CSV 使用 UTF-8-SIG 编码，可直接用 Excel/WPS 打开。所有输出的解释见 `docs/output-data-dictionary.md`。
 
 ## 6. 在 Terminal 中运行
 
@@ -394,3 +395,5 @@ config = AlgorithmConfig(
 - 分城市运行小样本确认数据口径。
 - 避免把明显超出目标城市范围的 Geometry 传入。
 - H3 分辨率越高，单元数量增长越快；不要在未评估数据量时提高分辨率。
+- 客户坐标反算默认按 500,000 行分块。内存紧张时可降低 `coordinate_transform_chunk_size`（例如 200,000）；这不改变算法结果，但过小会增加批次调度耗时。
+- 两张客户级输出仍保留全量原始和诊断字段，因此千万级数据仍需要充足内存；分块转换降低的是中间峰值，不会消除最终输出本身的内存需求。

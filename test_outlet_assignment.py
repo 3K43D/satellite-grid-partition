@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import warnings
 
 import pandas as pd
 
@@ -211,6 +212,57 @@ def test_parquet_is_default_ready_and_csv_is_retained() -> None:
         assert len(grid_table) == len(result.grids)
 
 
+def test_parquet_mixed_object_fallback_does_not_mutate_result() -> None:
+    outlets = pd.DataFrame(
+        [
+            {
+                "二级机构": "上海",
+                "城市": "上海",
+                "网点名称-正式": "测试网点",
+                "经度": 121.47,
+                "纬度": 31.23,
+            }
+        ]
+    )
+    result = _run(outlets)
+
+    # 模拟原始客户表中保留了字符串 + 整数的扩展字段。
+    result.customer_diagnostic["mixed_source_field"] = None
+    result.customer_diagnostic.at[0, "mixed_source_field"] = "A"
+    result.customer_diagnostic.at[1, "mixed_source_field"] = 1
+    result.grid_customer_detail["mixed_source_field"] = None
+    result.grid_customer_detail.at[0, "mixed_source_field"] = "A"
+    result.grid_customer_detail.at[1, "mixed_source_field"] = 1
+
+    with TemporaryDirectory() as temp_dir:
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            sg.save_result_parquet(result, temp_dir)
+
+        assert any(
+            "仅在保存副本中转为字符串" in str(item.message)
+            for item in captured
+        )
+        saved_diagnostic = pd.read_parquet(
+            Path(temp_dir) / "07_customer_diagnostic.parquet"
+        )
+        saved_detail = pd.read_parquet(
+            Path(temp_dir) / "08_grid_customer_detail.parquet"
+        )
+        assert saved_diagnostic.loc[:1, "mixed_source_field"].tolist() == [
+            "A",
+            "1",
+        ]
+        assert saved_detail.loc[:1, "mixed_source_field"].tolist() == [
+            "A",
+            "1",
+        ]
+
+    # 文件副本转换不得回写 AlgorithmResult。
+    assert result.customer_diagnostic.at[1, "mixed_source_field"] == 1
+    assert result.grid_customer_detail.at[1, "mixed_source_field"] == 1
+
+
 def test_invalid_outlet_coordinate_rejected() -> None:
     invalid_outlet = pd.DataFrame(
         [
@@ -236,5 +288,6 @@ if __name__ == "__main__":
     test_only_outlet_and_missing_city()
     test_same_outlet_can_have_multiple_workplaces()
     test_parquet_is_default_ready_and_csv_is_retained()
+    test_parquet_mixed_object_fallback_does_not_mutate_result()
     test_invalid_outlet_coordinate_rejected()
     print("网点归属测试通过。")

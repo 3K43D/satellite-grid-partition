@@ -266,6 +266,11 @@ class AlgorithmConfig:
     # 仅记录墙上时间，不写入算法输出，不参与任何判断。
     enable_timing: bool = True
 
+    # 客户点 GCJ-02 -> WGS84 向量化反算的单批行数。
+    # 分块只降低中间 NumPy 数组的峰值内存，每个点的公式与
+    # 顺序均不变，不影响 H3 和专员格结果。
+    coordinate_transform_chunk_size: int = 500_000
+
 
 @dataclass
 class AlgorithmResult:
@@ -1558,10 +1563,11 @@ def prepare_customers_and_attach_fyp(
         "_aoi_lat",
     ]
     customer_rows_before_dedup = len(cust)
-    cust = cust.drop_duplicates(
+    cust.drop_duplicates(
         subset=duplicate_subset,
         keep="first",
-    ).copy()
+        inplace=True,
+    )
     exact_duplicates_removed = customer_rows_before_dedup - len(cust)
     if exact_duplicates_removed > 0:
         warnings.warn(
@@ -1606,6 +1612,7 @@ def prepare_customers_and_attach_fyp(
             "其余冲突请先在源数据中处理。\n"
             f"示例：\n{examples}"
         )
+    del conflicting_duplicate
 
     # 非空 AOI_ID 必须具有完整、合法且一致的代表质心。
     aoi_coordinate_valid = (
@@ -1628,9 +1635,21 @@ def prepare_customers_and_attach_fyp(
             "检测到非空 AOI_ID 缺少合法的 aoi_lng/aoi_lat。\n"
             f"示例：\n{examples}"
         )
+    del invalid_aoi_coordinate
 
-    aoi_rows = cust[cust["_has_aoi"]].copy()
-    if not aoi_rows.empty:
+    # AOI 校验只需要下列字段，避免在千万级客户宽表上
+    # 临时复制所有原始列和诊断列。
+    aoi_rows = cust.loc[
+        cust["_has_aoi"],
+        [
+            "_aoi_id_norm",
+            cols.customer_city,
+            "_aoi_lng",
+            "_aoi_lat",
+        ],
+    ].copy()
+    has_any_aoi = not aoi_rows.empty
+    if has_any_aoi:
         aoi_city_count = aoi_rows.groupby(
             "_aoi_id_norm",
             sort=False,
@@ -1692,9 +1711,16 @@ def prepare_customers_and_attach_fyp(
         cust["_aoi_lat_canonical"] = cust["_aoi_id_norm"].map(
             canonical_aoi_coordinate["canonical_aoi_lat"]
         )
+        del (
+            aoi_city_count,
+            cross_city_aoi,
+            aoi_coordinate_span,
+            inconsistent_aoi_coordinate,
+        )
     else:
         cust["_aoi_lng_canonical"] = np.nan
         cust["_aoi_lat_canonical"] = np.nan
+    del aoi_rows
 
     cust["_customer_coordinate_valid"] = (
         cust["_lng"].between(-180, 180)
@@ -1703,6 +1729,7 @@ def prepare_customers_and_attach_fyp(
     cust["_aoi_coordinate_valid"] = (
         cust["_has_aoi"] & aoi_coordinate_valid
     )
+    del aoi_coordinate_valid
     cust["_allocation_lng"] = np.where(
         cust["_has_aoi"],
         cust["_aoi_lng_canonical"],
@@ -1734,16 +1761,31 @@ def prepare_customers_and_attach_fyp(
     ) -> Tuple[np.ndarray, np.ndarray]:
         output_lng = np.full(input_lng.shape, np.nan, dtype=np.float64)
         output_lat = np.full(input_lat.shape, np.nan, dtype=np.float64)
-        if source_coordinate_system == "GCJ02":
-            converted_lng, converted_lat = gcj02_to_wgs84_array(
-                input_lng[valid_mask],
-                input_lat[valid_mask],
-            )
-        else:
-            converted_lng = input_lng[valid_mask]
-            converted_lat = input_lat[valid_mask]
-        output_lng[valid_mask] = converted_lng
-        output_lat[valid_mask] = converted_lat
+        chunk_size = int(config.coordinate_transform_chunk_size)
+
+        # 按原始行顺序分块；转换公式对每个坐标独立，因此
+        # 与整批调用得到的每行数值完全一致。
+        for start in range(0, len(input_lng), chunk_size):
+            end = min(start + chunk_size, len(input_lng))
+            chunk_valid = valid_mask[start:end]
+            if not chunk_valid.any():
+                continue
+
+            chunk_lng = input_lng[start:end]
+            chunk_lat = input_lat[start:end]
+            if source_coordinate_system == "GCJ02":
+                converted_lng, converted_lat = gcj02_to_wgs84_array(
+                    chunk_lng[chunk_valid],
+                    chunk_lat[chunk_valid],
+                )
+            else:
+                converted_lng = chunk_lng[chunk_valid]
+                converted_lat = chunk_lat[chunk_valid]
+
+            output_lng_chunk = output_lng[start:end]
+            output_lat_chunk = output_lat[start:end]
+            output_lng_chunk[chunk_valid] = converted_lng
+            output_lat_chunk[chunk_valid] = converted_lat
         return output_lng, output_lat
 
     customer_wgs84_lng, customer_wgs84_lat = convert_input_arrays_to_wgs84(
@@ -1755,7 +1797,7 @@ def prepare_customers_and_attach_fyp(
     # AOI 质心只按唯一 AOI 转换一次，再映射回成员客户，避免重复反算。
     allocation_wgs84_lng = customer_wgs84_lng.copy()
     allocation_wgs84_lat = customer_wgs84_lat.copy()
-    if not aoi_rows.empty:
+    if has_any_aoi:
         unique_aoi_lng = canonical_aoi_coordinate[
             "canonical_aoi_lng"
         ].to_numpy(dtype=np.float64)
@@ -1800,6 +1842,27 @@ def prepare_customers_and_attach_fyp(
         config.restrict_to_admin_street
     )
 
+    # 数组已写入 cust，及时释放外部引用，避免它们与
+    # 后续 H3 映射和聚合中间表同时驻留。
+    del (
+        customer_wgs84_lng,
+        customer_wgs84_lat,
+        allocation_wgs84_lng,
+        allocation_wgs84_lat,
+    )
+    if has_any_aoi:
+        del (
+            canonical_aoi_coordinate,
+            unique_aoi_lng,
+            unique_aoi_lat,
+            unique_aoi_valid,
+            unique_aoi_wgs84_lng,
+            unique_aoi_wgs84_lat,
+            aoi_wgs84_lng_by_id,
+            aoi_wgs84_lat_by_id,
+            has_aoi_mask,
+        )
+
     cust["_fyp_available"] = cust["_fyp"].notna()
 
     if not config.allow_negative_fyp:
@@ -1827,7 +1890,10 @@ def prepare_customers_and_attach_fyp(
     )
     cust["_aoi_expected_fyp"] = np.nan
     if cust["_has_aoi"].any():
-        aoi_member_rows = cust[cust["_has_aoi"]]
+        aoi_member_rows = cust.loc[
+            cust["_has_aoi"],
+            ["_aoi_id_norm", "_customer_id_norm", "_fyp"],
+        ]
         aoi_customer_count_by_id = (
             aoi_member_rows.loc[
                 aoi_member_rows["_customer_id_norm"] != "",
@@ -1861,6 +1927,11 @@ def prepare_customers_and_attach_fyp(
             cust["_has_aoi"],
             "_aoi_expected_fyp",
         ] = aoi_expected_fyp.astype(float)
+        del (
+            aoi_member_rows,
+            aoi_customer_count_by_id,
+            aoi_expected_fyp,
+        )
 
     # 分配坐标有效才做 H3。如果坐标有重复（尤其是 AOI 客户），
     # 先对唯一坐标计算 H3，再按原顺序映射回客户。不做任何
@@ -1944,7 +2015,19 @@ def prepare_customers_and_attach_fyp(
         mapped_h3[pd.isna(mapped_h3)] = None
         h3_ids[valid_positions] = mapped_h3
 
-    cust["_h3_id"] = h3_ids.tolist()
+    # 直接挂载 object ndarray，避免额外生成一个千万级
+    # Python list。
+    cust["_h3_id"] = h3_ids
+    if valid_positions.size:
+        del (
+            valid_coordinates,
+            duplicate_coordinate_mask,
+            unique_coordinates,
+            mapped_h3,
+            use_unique_coordinate_mapping,
+            coordinate_to_h3,
+        )
+    del valid_coordinate_mask, valid_positions, h3_ids
 
     pool_lookup = h3_pool[
         [
@@ -1971,6 +2054,7 @@ def prepare_customers_and_attach_fyp(
         how="left",
         validate="many_to_one",
     )
+    del pool_lookup
 
     cust["_h3_in_admin_geometry"] = cust["_h3_admin_code"].notna()
 
@@ -2021,8 +2105,12 @@ def prepare_customers_and_attach_fyp(
     )
 
     # 合法客户 FYP 与去重客户数分别聚合，再挂回完整 H3 池。
-    eligible_fyp = cust[cust["_legal_h3_candidate"]].copy()
-    eligible_count = cust[cust["_legal_customer_for_count"]].copy()
+    # 两次聚合只保留必需列，避免为合法客户各复制一次
+    # 完整诊断宽表。
+    eligible_fyp = cust.loc[
+        cust["_legal_h3_candidate"],
+        [cols.customer_city, "_h3_id", "_fyp"],
+    ].copy()
 
     fyp_agg = (
         eligible_fyp.groupby(
@@ -2039,6 +2127,12 @@ def prepare_customers_and_attach_fyp(
             }
         )
     )
+    del eligible_fyp
+
+    eligible_count = cust.loc[
+        cust["_legal_customer_for_count"],
+        [cols.customer_city, "_h3_id", "_customer_id_norm"],
+    ].copy()
 
     count_agg = (
         eligible_count.groupby(
@@ -2055,6 +2149,7 @@ def prepare_customers_and_attach_fyp(
             }
         )
     )
+    del eligible_count
 
     agg = fyp_agg.merge(
         count_agg,
@@ -2062,15 +2157,15 @@ def prepare_customers_and_attach_fyp(
         how="outer",
         validate="one_to_one",
     )
+    del fyp_agg, count_agg
 
-    pool = h3_pool.copy()
-
-    pool = pool.merge(
+    pool = h3_pool.merge(
         agg,
         on=["city", "h3_id"],
         how="left",
         validate="one_to_one",
     )
+    del agg
 
     pool["h3_expected_fyp"] = (
         pool["h3_expected_fyp"].fillna(0.0).astype(float)
@@ -3092,7 +3187,9 @@ def build_grid_customer_detail(
     不能用“是否成功生成 h3_id”替代。
     """
 
-    detail = customer_diagnostic.copy()
+    # 此处后续只新增顺序列，随后的 merge 会产生新结果；
+    # 浅复制可避免在 merge 前先完整深拷贝一遍客户诊断表。
+    detail = customer_diagnostic.copy(deep=False)
     detail["_customer_row_order"] = np.arange(len(detail))
 
     assignment_required = [
@@ -3425,9 +3522,11 @@ def validate_aoi_single_grid(
     if grid_customer_detail.empty:
         return
 
-    aoi_rows = grid_customer_detail[
-        grid_customer_detail["_has_aoi"].fillna(False)
-    ].copy()
+    aoi_mask = grid_customer_detail["_has_aoi"].fillna(False)
+    aoi_rows = grid_customer_detail.loc[
+        aoi_mask,
+        ["_aoi_id_norm", "_h3_id", "grid_id"],
+    ]
     if aoi_rows.empty:
         return
 
@@ -3475,7 +3574,25 @@ def build_coverage_metrics(
     3. 真正进入算法后仍未形成卫星单元的损失。
     """
 
-    cust = customer_diagnostic.copy()
+    coverage_columns = list(
+        dict.fromkeys(
+            [
+                cols.customer_city,
+                "_h3_id",
+                "_customer_id_available",
+                "_valid_coordinate",
+                "_fyp_available",
+                "_h3_in_admin_geometry",
+                "_admin_consistent",
+                "_excluded_by_existing_grid",
+                "_legal_customer_for_count",
+                "_legal_h3_candidate",
+                "_fyp",
+                "_admin_restriction_enabled",
+            ]
+        )
+    )
+    cust = customer_diagnostic[coverage_columns].copy()
 
     assigned_h3_by_city: Set[Tuple[str, str]] = set()
 
@@ -3935,6 +4052,24 @@ def run_satellite_grid_algorithm(
     ):
         raise ValueError("min_customer_count 必须是正整数。")
 
+    try:
+        coordinate_transform_chunk_size_value = float(
+            config.coordinate_transform_chunk_size
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "coordinate_transform_chunk_size 必须是正整数。"
+        ) from exc
+
+    if (
+        not math.isfinite(coordinate_transform_chunk_size_value)
+        or coordinate_transform_chunk_size_value <= 0
+        or not coordinate_transform_chunk_size_value.is_integer()
+    ):
+        raise ValueError(
+            "coordinate_transform_chunk_size 必须是正整数。"
+        )
+
     # 提前校验坐标系配置。当前 H3 内部统一使用 WGS84。
     normalize_coordinate_system(config.input_coordinate_system)
 
@@ -4183,12 +4318,97 @@ def save_result_csv(
         )
 
 
+def _parquet_failure_column(
+    exc: BaseException,
+    columns: Iterable[Any],
+) -> Optional[Any]:
+    """从 PyArrow 异常中提取无法转换的 DataFrame 列。"""
+    messages: List[str] = []
+    current: Optional[BaseException] = exc
+    visited: Set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        messages.extend(
+            str(arg) for arg in current.args if isinstance(arg, str)
+        )
+        current = current.__cause__ or current.__context__
+
+    for message in messages:
+        match = re.search(
+            r"Conversion failed for column (.*?) with type ",
+            message,
+        )
+        if match is None:
+            continue
+        failed_name = match.group(1)
+        for column in columns:
+            if str(column) == failed_name:
+                return column
+    return None
+
+
+def _write_parquet_with_object_fallback(
+    df: pd.DataFrame,
+    output_path: Path,
+    compression: str,
+) -> List[Any]:
+    """
+    写出单张 Parquet。
+
+    正常情况直接写原 DataFrame。如果 PyArrow 明确报告某个
+    object 列无法确定统一类型，仅在浅复制的写出副本中将该列
+    转为 pandas 字符串类型，然后重试。算法内存中的结果不会被修改。
+    """
+    working_df = df
+    converted_columns: List[Any] = []
+
+    while True:
+        try:
+            working_df.to_parquet(
+                output_path,
+                index=False,
+                engine="pyarrow",
+                compression=compression,
+            )
+            return converted_columns
+        except Exception as exc:
+            failed_column = _parquet_failure_column(
+                exc,
+                working_df.columns,
+            )
+            if (
+                failed_column is None
+                or failed_column in converted_columns
+            ):
+                raise
+
+            if working_df is df:
+                # 只复制 DataFrame 结构，其他列仍共享原数据块；
+                # 下面的单列替换不会回写原 DataFrame。
+                working_df = df.copy(deep=False)
+
+            try:
+                working_df[failed_column] = working_df[
+                    failed_column
+                ].astype("string")
+            except Exception as conversion_exc:
+                raise RuntimeError(
+                    f"Parquet 不兼容列 {failed_column!r} 转为字符串失败。"
+                ) from conversion_exc
+            converted_columns.append(failed_column)
+
+
 def save_result_parquet(
     result: AlgorithmResult,
     output_dir: str | Path,
     compression: str = "snappy",
 ) -> None:
-    """将 8 张结果表保存为 Parquet，默认使用 Snappy 压缩。"""
+    """
+    将 8 张结果表保存为 Parquet，默认使用 Snappy 压缩。
+
+    若原始扩展字段是 Parquet 无法序列化的混合 object 列，
+    仅将该列在写出副本中转为字符串，并发出警告。
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(
         parents=True,
@@ -4206,20 +4426,33 @@ def save_result_parquet(
         "08_grid_customer_detail.parquet": result.grid_customer_detail,
     }
 
+    converted_by_file: Dict[str, List[Any]] = {}
     for filename, df in tables.items():
         try:
-            df.to_parquet(
+            converted_columns = _write_parquet_with_object_fallback(
+                df,
                 output_dir / filename,
-                index=False,
-                engine="pyarrow",
-                compression=compression,
+                compression,
             )
+            if converted_columns:
+                converted_by_file[filename] = converted_columns
         except Exception as exc:
             raise RuntimeError(
                 f"保存 Parquet 失败：{filename}。"
-                "请检查 pyarrow 是否安装，以及输入表是否包含"
-                "无法序列化的混合对象列。"
+                "请检查 pyarrow 是否安装，或字段中是否包含"
+                "即使转为字符串也无法处理的对象。"
             ) from exc
+
+    if converted_by_file:
+        details = "; ".join(
+            f"{filename}: {', '.join(map(str, columns))}"
+            for filename, columns in converted_by_file.items()
+        )
+        warnings.warn(
+            "Parquet 写出时检测到混合/不兼容 object 列，"
+            "已仅在保存副本中转为字符串；内存中的"
+            f"AlgorithmResult 未改变。{details}"
+        )
 
 
 # ============================================================

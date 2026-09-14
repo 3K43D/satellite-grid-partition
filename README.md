@@ -21,6 +21,7 @@
 - 专员格完成后才归属网点：网点表每行代表一个职场坐标，同一网点允许有多个职场；选择距 Grid GCJ-02 几何质心最近的一行，同距离按网点名称、原始行顺序依次选择。
 - 客户不单独计算网点，只继承成功专员格的网点；无成功专员格的客户网点字段为空。
 - 默认在终端 / Notebook 输出 10 个主阶段耗时，仅用于性能定位，不写入或影响算法结果。
+- 客户坐标转换默认每 500,000 行分块处理，以降低千万级数据的中间数组峰值内存；转换公式、行顺序和输出不变。
 
 ## 仓库结构
 
@@ -109,6 +110,7 @@ result = run_satellite_grid_algorithm(
         input_coordinate_system="GCJ02",
         restrict_to_admin_street=True,
         build_grid_geometry=True,
+        coordinate_transform_chunk_size=500_000,
     ),
 )
 
@@ -172,7 +174,7 @@ result.customer_diagnostic
 
 每张表的字段、公式和业务解读见 [输出数据字典](docs/output-data-dictionary.md)。完整运行步骤和问题排查见 [操作指引](docs/operation-guide.md)。
 
-命令行和直接运行主文件默认保存 Snappy 压缩的 Parquet。需要 CSV 时，可在命令行增加 `--output-format csv`，或在 Notebook 中调用 `save_result_csv`。
+命令行和直接运行主文件默认保存 Snappy 压缩的 Parquet。需要 CSV 时，可在命令行增加 `--output-format csv`，或在 Notebook 中调用 `save_result_csv`。如果原始扩展字段在同一列混入了字符串、数字或其他不兼容对象，程序会仅在 Parquet 写出副本中将实际报错的列转成字符串，并列出字段名；内存中的 `result` 不会改变。
 
 ## Terminal 运行与自定义列名
 
