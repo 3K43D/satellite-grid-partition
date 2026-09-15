@@ -41,6 +41,7 @@ config = AlgorithmConfig(
 | `lat` | number | GCJ-02 纬度，范围 `[-90, 90]` |
 | `area_admin_code` | string | 当前数据实际为行政街道名称；开启街道限制时应与 `area_name` 对齐，关闭时可不提供 |
 | `expected_fyp` | number/null | 0 合法；空值客户仍计人数，但不贡献 FYP |
+| `pred_prob` | number/null | 保留在客户维度大表中，不参与网格划分 |
 | `aoi_id` | string/null | 客户所属 AOI；空值表示无 AOI，每条空值客户独立处理，不会归为同一组 |
 | `aoi_lng` | number/null | AOI 质心经度；`aoi_id` 非空时必填，并与其他空间输入使用相同坐标系 |
 | `aoi_lat` | number/null | AOI 质心纬度；同一 `aoi_id` 的质心经纬度必须一致 |
@@ -121,6 +122,85 @@ result = run_satellite_grid_algorithm(
 ```
 
 修改 `.py` 后，如果 Notebook 已导入过旧版本，请重启 Kernel，或显式重新加载模块。
+
+### 3.1 大数据按城市运行，只保存客户大表
+
+一次传入全量数据，程序会按客户表中的城市升序串行计算。每个城市计算完后，只保存该城市的 `grid_customer_detail` Parquet，然后释放该城市的其他结果：
+
+```python
+from satellite_grid_partition_v1 import (
+    AlgorithmConfig,
+    ColumnConfig,
+    run_satellite_grid_by_city_to_parquet,
+)
+
+cols = ColumnConfig()
+config = AlgorithmConfig(
+    h3_resolution=9,
+    min_customer_count=50,
+    input_coordinate_system="GCJ02",
+    restrict_to_admin_street=True,
+    require_customer_admin_match=True,
+    build_grid_geometry=True,
+    coordinate_transform_chunk_size=500_000,
+)
+
+city_run_summary = run_satellite_grid_by_city_to_parquet(
+    customer_df=customer_df,
+    admin_df=admin_df,
+    existing_grid_df=existing_grid_df,
+    fyp_threshold_df=fyp_threshold_df,
+    distance_df=distance_df,
+    outlet_df=outlet_df,
+    output_dir="city_customer_detail_output_20260915",
+    cols=cols,
+    config=config,
+    compression="snappy",
+    overwrite=False,
+)
+```
+
+查看失败城市：
+
+```python
+failed_cities = city_run_summary.loc[
+    city_run_summary["status"] == "FAILED",
+    ["city", "error_type", "error_message"],
+]
+failed_cities
+```
+
+单个城市失败时，程序不会停止，也不会保存该城市的有效结果文件；它会继续运行下一个城市，最后在 Notebook 中打印失败城市和首行错误原因。完整原因始终保留在 `city_run_summary["error_message"]` 中。
+
+`city_run_summary` 主要字段：
+
+| 字段 | 解读 |
+|---|---|
+| `city` | 客户城市 |
+| `status` | `SUCCESS`、`SAVED_UNASSIGNED_NO_ADMIN_BOUNDARY` 或 `FAILED` |
+| `file_saved` | 该城市 Parquet 是否写出成功 |
+| `input_row_count` / `output_row_count` | 输入行数与去除完全重复后的输出行数 |
+| `successful_grid_customer_count` | `has_successful_grid=True` 的客户行数 |
+| `grid_count` | 该城市成功产生的专员格数 |
+| `output_file` | 已写出的 Parquet 绝对路径；失败时为空 |
+| `elapsed_seconds` | 该城市计算加写出耗时 |
+| `error_type` / `error_message` | 失败异常类型与完整原因 |
+
+客户城市没有行政边界时，为了保留所有客户，会写出一张 `grid_id` 全空的客户大表，状态为 `SAVED_UNASSIGNED_NO_ADMIN_BOUNDARY`。行政表、参数表等表中只出现但客户表未出现的城市，不会被单独运行。
+
+请为每次正式运行使用新的空目录。`overwrite=False` 是防误覆盖的默认值；设为 `True` 只会覆盖本次同名文件，不会清理上次运行留下的其他城市文件。
+
+各城市文件使用同一套 Parquet Schema，因此可以直接按整个目录读取：
+
+```python
+all_city_customer_detail = pd.read_parquet(
+    "city_customer_detail_output_20260915"
+)
+```
+
+为避免“某城市全空、另一城市有值”造成类型冲突，落盘副本中的标准数值/布尔字段会固定类型，其他 `object` 或 category 列会保存为字符串。这只是写出格式统一，不会回写输入 DataFrame 或改变划分结果。
+
+这个入口会避免所有城市的 8 张结果同时留在内存中，但全量输入 `customer_df` 仍然在内存里。全表缺列或 `AlgorithmConfig` 非法等无法归属某城市的结构性问题，会在开始分城市前直接报错。
 
 ## 4. 推荐验收顺序
 
@@ -233,6 +313,7 @@ cp column_config.example.json column_config.json
   "customer_lat": "客户纬度",
   "customer_admin_code": "行政街道名称",
   "customer_expected_fyp": "预计FYP",
+  "customer_pred_prob": "客户预测概率",
   "customer_aoi_id": "AOI_ID",
   "customer_aoi_lng": "AOI经度",
   "customer_aoi_lat": "AOI纬度",

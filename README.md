@@ -20,8 +20,10 @@
 - 非空 `aoi_id` 的客户统一使用该 AOI 的质心经纬度映射 H3，保证同一 AOI 最多进入一个专员格；空 `aoi_id` 客户仍各自使用客户坐标。
 - 专员格完成后才归属网点：网点表每行代表一个职场坐标，同一网点允许有多个职场；选择距 Grid GCJ-02 几何质心最近的一行，同距离按网点名称、原始行顺序依次选择。
 - 客户不单独计算网点，只继承成功专员格的网点；无成功专员格的客户网点字段为空。
+- `pred_prob` 保留在客户维度大表中，仅供后续分析，不参与网格划分。
 - 默认在终端 / Notebook 输出 10 个主阶段耗时，仅用于性能定位，不写入或影响算法结果。
 - 客户坐标转换默认每 500,000 行分块处理，以降低千万级数据的中间数组峰值内存；转换公式、行顺序和输出不变。
+- 大数据可一次传入全部城市，再按客户城市串行计算；每个城市只保存 `grid_customer_detail` Parquet 后即释放中间结果。单城市失败会记录原因并继续下一城市。
 
 ## 仓库结构
 
@@ -56,7 +58,7 @@ pip install -r requirements.txt
 
 | 输入 | 必需字段 | 说明 |
 |---|---|---|
-| 客户表 | `customer_id`, `city`, `lng`, `lat`, `area_admin_code`, `expected_fyp`, `aoi_id`, `aoi_lng`, `aoi_lat` | 经纬度均为 GCJ-02；非空 AOI 必须有一致质心；空 `aoi_id` 之间互不归组；关闭街道限制时 `area_admin_code` 可不提供 |
+| 客户表 | `customer_id`, `city`, `lng`, `lat`, `area_admin_code`, `expected_fyp`, `pred_prob`, `aoi_id`, `aoi_lng`, `aoi_lat` | 经纬度均为 GCJ-02；`pred_prob` 只随客户明细输出；非空 AOI 必须有一致质心；空 `aoi_id` 之间互不归组；关闭街道限制时 `area_admin_code` 可不提供 |
 | 行政街道表 | `city`, `area_code`, `area_name`, `area_geometry` | 每个 `city + area_code` 一行；Geometry 支持 GeoJSON、WKT、WKB/EWKB Hex；坐标为 GCJ-02 |
 | 已有网格表 | `city`, `agent_net_id`, `basic_net_id`, `basic_net_geom` | GCJ-02 已占用空间，不参与新专员格划分 |
 | FYP 门槛表 | `city`, `target_expected_fyp` | 每个城市的最低 FYP |
@@ -71,6 +73,7 @@ AOI 输入不需要提前聚合成一行。算法保留原始客户明细：同�
 
 ```python
 cols = ColumnConfig(
+    customer_pred_prob="客户预测概率",
     customer_aoi_id="AOI_ID",
     customer_aoi_lng="AOI经度",
     customer_aoi_lat="AOI纬度",
@@ -85,6 +88,7 @@ import pandas as pd
 from satellite_grid_partition_v1 import (
     AlgorithmConfig,
     ColumnConfig,
+    run_satellite_grid_by_city_to_parquet,
     run_satellite_grid_algorithm,
     save_result_csv,
     save_result_parquet,
@@ -145,6 +149,60 @@ result.coverage_metrics
 result.h3_pool
 result.customer_diagnostic
 ```
+
+### 千万级数据：按城市只保存客户大表
+
+如果最终只需要各城市的 `grid_customer_detail`，推荐改用：
+
+```python
+from satellite_grid_partition_v1 import (
+    AlgorithmConfig,
+    ColumnConfig,
+    run_satellite_grid_by_city_to_parquet,
+)
+
+cols = ColumnConfig()
+config = AlgorithmConfig(
+    min_customer_count=50,
+    input_coordinate_system="GCJ02",
+    restrict_to_admin_street=True,
+    build_grid_geometry=True,
+    coordinate_transform_chunk_size=500_000,
+)
+
+city_run_summary = run_satellite_grid_by_city_to_parquet(
+    customer_df=customer_df,
+    admin_df=admin_df,
+    existing_grid_df=existing_grid_df,
+    fyp_threshold_df=fyp_threshold_df,
+    distance_df=distance_df,
+    outlet_df=outlet_df,
+    output_dir="city_customer_detail_output_20260915",
+    cols=cols,
+    config=config,
+    compression="snappy",
+    overwrite=False,
+)
+
+failed_cities = city_run_summary.query("status == 'FAILED'")[
+    ["city", "error_type", "error_message"]
+]
+failed_cities
+```
+
+程序只遍历客户表中实际出现的城市，并按规范化后的城市名升序运行。文件名示例为 `0001_上海_grid_customer_detail.parquet`。该模式不保存 Grid、H3 明细、覆盖率等其他 7 张表，返回值只是一张很小的城市运行汇总表。
+
+状态含义：
+
+- `SUCCESS`：算法完成且客户 Parquet 写出成功。
+- `SAVED_UNASSIGNED_NO_ADMIN_BOUNDARY`：客户城市没有行政边界；仍保存该城市全部客户，但 `grid_id` 为空。
+- `FAILED`：该城市计算或保存失败，不生成该城市的有效输出文件；程序继续处理后续城市，并在最后打印失败城市及原因。
+
+请每次使用新的空目录。`overwrite=False` 可防止意外覆盖；确实需要覆盖同名文件时才设为 `True`。如果更换了城市集合，直接复用旧目录可能留下上一次的旧文件。
+
+为了让 `pd.read_parquet("整个输出文件夹")` 能同时读取所有城市，该模式会在落盘副本中统一标准数值和布尔字段的类型，并将其余 `object`/category 字段统一保存为字符串。字段值保留，且不会回写原始输入或改变算法判断。
+
+该模式会降低“多个城市全部结果同时常驻内存”的峰值，但传入的全量 `customer_df` 本身仍需要放在内存中。全表缺少必需列、算法配置非法等无法归属到某一城市的结构性错误，仍会在开始前直接报错。
 
 运行时会看到类似：
 

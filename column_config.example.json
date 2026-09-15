@@ -5,6 +5,7 @@
   "customer_lat": "lat",
   "customer_admin_code": "area_admin_code",
   "customer_expected_fyp": "expected_fyp",
+  "customer_pred_prob": "pred_prob",
   "customer_aoi_id": "aoi_id",
   "customer_aoi_lng": "aoi_lng",
   "customer_aoi_lat": "aoi_lat",

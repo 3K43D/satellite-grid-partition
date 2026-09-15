@@ -105,8 +105,13 @@ def _build_inputs():
             }
         )
 
+    customer_df = pd.DataFrame(customers)
+    customer_df["pred_prob"] = [
+        index / 1000.0 for index in range(len(customer_df))
+    ]
+
     return (
-        pd.DataFrame(customers),
+        customer_df,
         admin_df,
         pd.DataFrame(columns=["city", "basic_net_geom"]),
         pd.DataFrame(

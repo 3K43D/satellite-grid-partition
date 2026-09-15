@@ -81,6 +81,9 @@ def _make_inputs():
     )
 
     customer_df = pd.DataFrame(customers)
+    customer_df["pred_prob"] = [
+        index / 100.0 for index in range(len(customer_df))
+    ]
     customer_df["aoi_id"] = pd.NA
     customer_df["aoi_lng"] = pd.NA
     customer_df["aoi_lat"] = pd.NA
@@ -175,6 +178,8 @@ def test_admin_street_switch() -> None:
     assigned = city_wide.grid_customer_detail.query(
         "has_successful_grid == True"
     )
+    assert "pred_prob" in city_wide.grid_customer_detail.columns
+    assert "高价值客户" not in city_wide.grid_customer_detail.columns
     assert assigned["customer_id"].nunique() == 60
     assert set(assigned["customer_admin_name"]) == {"街道A", "街道B"}
     assert not assigned["admin_restriction_enabled"].any()

@@ -224,6 +224,7 @@
 | `customer_coordinate_system` | 上述客户坐标的坐标系，当前为 `GCJ02` |
 | `customer_wgs84_lng`, `customer_wgs84_lat` | 原始客户坐标转换后的 WGS84 |
 | `expected_fyp` | 数值化客户 FYP |
+| `pred_prob` | 客户表中的预测概率；仅供后续分析，不参与网格划分 |
 | `aoi_id`, `has_aoi` | 原始 AOI ID 和是否具有 AOI；空 AOI 客户互不归组 |
 | `aoi_lng`, `aoi_lat` | 同一 AOI 统一后的代表质心经纬度 |
 | `aoi_customer_count`, `aoi_expected_fyp` | AOI 中原始去重客户数和 FYP 合计 |

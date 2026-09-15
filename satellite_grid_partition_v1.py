@@ -63,6 +63,7 @@ N. 同一非空 AOI_ID 必须使用一致的质心经纬度并统一映射到一
 O. 网点坐标使用 GCJ-02，每行代表一个职场坐标，同一网点允许有多行。
    候选行只按城市筛选；选择距 Grid GCJ-02 几何质心最近的一行，距离
    相同时按网点名称、输入原始行顺序依次选择；二级机构为省，只随结果输出。
+P. pred_prob 只在客户维度大表中保留展示，不参与划分。
 
 建议安装
 --------
@@ -123,6 +124,7 @@ python satellite_grid_partition_v1.py
 from __future__ import annotations
 
 import ast
+import gc
 import json
 import math
 import re
@@ -175,6 +177,7 @@ class ColumnConfig:
     customer_lat: str = "lat"
     customer_admin_code: str = "area_admin_code"
     customer_expected_fyp: str = "expected_fyp"
+    customer_pred_prob: str = "pred_prob"
 
     # ---------- 行政街道表 ----------
     admin_city: str = "city"
@@ -344,6 +347,44 @@ def _print_timing(
     suffix = f" | {detail}" if detail else ""
     elapsed = time.perf_counter() - started_at
     print(f"[TIMING] {label}: {elapsed:.3f}s{suffix}")
+
+
+def _validate_algorithm_config(config: AlgorithmConfig) -> None:
+    """校验完整运行和按城市运行共用的算法参数。"""
+    try:
+        min_customer_count_value = float(config.min_customer_count)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "min_customer_count 必须是正整数。"
+        ) from exc
+
+    if (
+        not math.isfinite(min_customer_count_value)
+        or min_customer_count_value <= 0
+        or not min_customer_count_value.is_integer()
+    ):
+        raise ValueError("min_customer_count 必须是正整数。")
+
+    try:
+        coordinate_transform_chunk_size_value = float(
+            config.coordinate_transform_chunk_size
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "coordinate_transform_chunk_size 必须是正整数。"
+        ) from exc
+
+    if (
+        not math.isfinite(coordinate_transform_chunk_size_value)
+        or coordinate_transform_chunk_size_value <= 0
+        or not coordinate_transform_chunk_size_value.is_integer()
+    ):
+        raise ValueError(
+            "coordinate_transform_chunk_size 必须是正整数。"
+        )
+
+    # 当前 H3 内部统一使用 WGS84。
+    normalize_coordinate_system(config.input_coordinate_system)
 
 
 def _safe_rate(numerator: float, denominator: float) -> float:
@@ -1490,6 +1531,7 @@ def prepare_customers_and_attach_fyp(
         cols.customer_lng,
         cols.customer_lat,
         cols.customer_expected_fyp,
+        cols.customer_pred_prob,
         cols.customer_aoi_id,
         cols.customer_aoi_lng,
         cols.customer_aoi_lat,
@@ -1557,6 +1599,7 @@ def prepare_customers_and_attach_fyp(
         "_lng",
         "_lat",
         "_fyp",
+        cols.customer_pred_prob,
         "_customer_admin_name_norm",
         "_aoi_id_norm",
         "_aoi_lng",
@@ -1589,6 +1632,7 @@ def prepare_customers_and_attach_fyp(
                     cols.customer_lng,
                     cols.customer_lat,
                     cols.customer_expected_fyp,
+                    cols.customer_pred_prob,
                     cols.customer_aoi_id,
                     cols.customer_aoi_lng,
                     cols.customer_aoi_lat,
@@ -3334,6 +3378,7 @@ def build_grid_customer_detail(
     detail["customer_wgs84_lng"] = detail["_customer_wgs84_lng"]
     detail["customer_wgs84_lat"] = detail["_customer_wgs84_lat"]
     detail["expected_fyp"] = detail["_fyp"]
+    detail["pred_prob"] = detail[cols.customer_pred_prob]
     detail["aoi_id"] = detail[cols.customer_aoi_id]
     detail["aoi_lng"] = detail["_aoi_lng_canonical"]
     detail["aoi_lat"] = detail["_aoi_lat_canonical"]
@@ -3370,6 +3415,7 @@ def build_grid_customer_detail(
     detail["counts_toward_grid_customer_minimum"] = detail[
         "has_successful_grid"
     ]
+
     detail["grid_assignment_status"] = np.select(
         [
             detail["has_successful_grid"],
@@ -3412,6 +3458,7 @@ def build_grid_customer_detail(
         "customer_wgs84_lng",
         "customer_wgs84_lat",
         "expected_fyp",
+        "pred_prob",
         "aoi_id",
         "aoi_lng",
         "aoi_lat",
@@ -4037,41 +4084,7 @@ def run_satellite_grid_algorithm(
     cols = cols or ColumnConfig()
     config = config or AlgorithmConfig()
     algorithm_started_at = time.perf_counter()
-
-    try:
-        min_customer_count_value = float(config.min_customer_count)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "min_customer_count 必须是正整数。"
-        ) from exc
-
-    if (
-        not math.isfinite(min_customer_count_value)
-        or min_customer_count_value <= 0
-        or not min_customer_count_value.is_integer()
-    ):
-        raise ValueError("min_customer_count 必须是正整数。")
-
-    try:
-        coordinate_transform_chunk_size_value = float(
-            config.coordinate_transform_chunk_size
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "coordinate_transform_chunk_size 必须是正整数。"
-        ) from exc
-
-    if (
-        not math.isfinite(coordinate_transform_chunk_size_value)
-        or coordinate_transform_chunk_size_value <= 0
-        or not coordinate_transform_chunk_size_value.is_integer()
-    ):
-        raise ValueError(
-            "coordinate_transform_chunk_size 必须是正整数。"
-        )
-
-    # 提前校验坐标系配置。当前 H3 内部统一使用 WGS84。
-    normalize_coordinate_system(config.input_coordinate_system)
+    _validate_algorithm_config(config)
 
     # 1. 城市参数
     step_started_at = time.perf_counter()
@@ -4453,6 +4466,682 @@ def save_result_parquet(
             "已仅在保存副本中转为字符串；内存中的"
             f"AlgorithmResult 未改变。{details}"
         )
+
+
+def _cross_city_key_conflict_examples(
+    key_values: pd.Series,
+    city_values: pd.Series,
+) -> Dict[str, List[str]]:
+    """
+    返回同一非空业务 Key 跨城市出现时的分城市示例。
+
+    先用 duplicated 筛出真正重复的 Key，避免在客户号
+    基本唯一时构造一张与全量客户等大的两列中间表。
+    """
+    duplicate_mask = (
+        (key_values != "")
+        & key_values.duplicated(keep=False)
+    )
+    if not duplicate_mask.any():
+        return {}
+
+    duplicate_pairs = pd.DataFrame(
+        {
+            "_key": key_values.loc[duplicate_mask],
+            "_city": city_values.loc[duplicate_mask],
+        }
+    ).drop_duplicates(["_key", "_city"], keep="first")
+
+    cross_city_mask = duplicate_pairs["_key"].duplicated(keep=False)
+    cross_city_pairs = duplicate_pairs.loc[cross_city_mask]
+    if cross_city_pairs.empty:
+        return {}
+
+    return {
+        str(city): group["_key"].astype(str).head(20).tolist()
+        for city, group in cross_city_pairs.groupby(
+            "_city",
+            sort=False,
+        )
+    }
+
+
+def _empty_h3_pool_for_unconfigured_city() -> pd.DataFrame:
+    """创建与正常 H3 池兼容的空表。"""
+    return pd.DataFrame(
+        {
+            "city": pd.Series(dtype=object),
+            "admin_code": pd.Series(dtype=object),
+            "admin_name": pd.Series(dtype=object),
+            "h3_id": pd.Series(dtype=object),
+            "center_lat": pd.Series(dtype=float),
+            "center_lng": pd.Series(dtype=float),
+            "center_wgs84_lat": pd.Series(dtype=float),
+            "center_wgs84_lng": pd.Series(dtype=float),
+            "center_gcj02_lat": pd.Series(dtype=float),
+            "center_gcj02_lng": pd.Series(dtype=float),
+            "is_existing_occupied": pd.Series(dtype=bool),
+            "admin_restriction_enabled": pd.Series(dtype=bool),
+        }
+    )
+
+
+def _build_unassigned_customer_detail(
+    customer_df: pd.DataFrame,
+    outlet_df: Optional[pd.DataFrame],
+    cols: ColumnConfig,
+    config: AlgorithmConfig,
+) -> pd.DataFrame:
+    """
+    为没有行政边界的客户城市产生完整未分配明细。
+
+    这与全量算法中“客户城市不在行政 H3 池”的口径一致：
+    仍计算客户/AOI 分配坐标和 H3 ID，但所有客户均不具备
+    空间合法性，grid_id 为空。
+    """
+    customer_diagnostic, _unused_pool = (
+        prepare_customers_and_attach_fyp(
+            customer_df,
+            _empty_h3_pool_for_unconfigured_city(),
+            cols,
+            config,
+        )
+    )
+    # 即使没有成功 Grid，也保持对该城市网点表的原有校验。
+    empty_grids = attach_outlets_to_grids(
+        pd.DataFrame(),
+        outlet_df,
+        cols,
+    )
+    detail = build_grid_customer_detail(
+        customer_diagnostic,
+        empty_grids,
+        pd.DataFrame(),
+        cols,
+    )
+    validate_aoi_single_grid(detail)
+    return detail
+
+
+CITY_DETAIL_PARQUET_FLOAT_COLUMNS = {
+    "customer_lng",
+    "customer_lat",
+    "customer_wgs84_lng",
+    "customer_wgs84_lat",
+    "expected_fyp",
+    "aoi_lng",
+    "aoi_lat",
+    "aoi_expected_fyp",
+    "allocation_lng",
+    "allocation_lat",
+    "allocation_wgs84_lng",
+    "allocation_wgs84_lat",
+    "assigned_h3_fyp",
+    "assigned_h3_customer_count",
+    "distance_to_grid_seed_m",
+    "h3_assignment_layer",
+    "h3_count",
+    "grid_fyp",
+    "target_expected_fyp",
+    "grid_customer_count",
+    "min_customer_count",
+    "customer_count_utilization",
+    "value_utilization",
+    "max_seed_distance_m",
+    "max_seed_radius_m",
+    "distance_diameter_km",
+    "grid_expansion_layers",
+    "grid_centroid_wgs84_lng",
+    "grid_centroid_wgs84_lat",
+    "grid_centroid_gcj02_lng",
+    "grid_centroid_gcj02_lat",
+    "grid_label_point_wgs84_lng",
+    "grid_label_point_wgs84_lat",
+    "grid_label_point_gcj02_lng",
+    "grid_label_point_gcj02_lat",
+    "assigned_outlet_lng",
+    "assigned_outlet_lat",
+    "distance_to_assigned_outlet_km",
+    "_customer_wgs84_lng",
+    "_customer_wgs84_lat",
+    "_aoi_lng",
+    "_aoi_lat",
+    "_aoi_lng_canonical",
+    "_aoi_lat_canonical",
+    "_aoi_expected_fyp",
+    "_allocation_lng",
+    "_allocation_lat",
+    "_allocation_wgs84_lng",
+    "_allocation_wgs84_lat",
+    "_wgs84_lng",
+    "_wgs84_lat",
+    "_lng",
+    "_lat",
+    "_fyp",
+}
+
+CITY_DETAIL_PARQUET_INTEGER_COLUMNS = {
+    "aoi_customer_count",
+    "_aoi_customer_count",
+}
+
+CITY_DETAIL_PARQUET_BOOLEAN_COLUMNS = {
+    "has_aoi",
+    "h3_assigned_to_grid",
+    "has_successful_grid",
+    "counts_toward_grid_customer_minimum",
+    "admin_restriction_enabled",
+    "_customer_id_available",
+    "_valid_coordinate",
+    "_admin_restriction_enabled",
+    "_customer_coordinate_valid",
+    "_has_aoi",
+    "_aoi_coordinate_valid",
+    "_fyp_available",
+    "_h3_in_admin_geometry",
+    "_admin_consistent",
+    "_excluded_by_existing_grid",
+    "_legal_customer_for_count",
+    "_legal_h3_candidate",
+    "_h3_existing_occupied",
+}
+
+
+def _normalize_city_detail_for_parquet(
+    detail: pd.DataFrame,
+    copy: bool = True,
+) -> pd.DataFrame:
+    """统一各城市客户 Parquet 的字段类型。
+
+    单城市中某列全空时，Pandas 可能将本应为数值/布尔
+    的字段推断为 object；不同城市的原始 object 列也可能
+    被 PyArrow 分别推断为数字和文本。这些 Parquet 单独可读，
+    但作为同一文件夹数据集读取时会发生 Schema 冲突。
+
+    本函数只创建落盘副本：标准数值/布尔字段固定类型，
+    其余 object/string/category 字段固定为字符串。算法中的
+    DataFrame 及业务判断不会被修改。
+    """
+    result = detail.copy(deep=False) if copy else detail
+
+    for column in result.columns.intersection(
+        sorted(CITY_DETAIL_PARQUET_FLOAT_COLUMNS),
+        sort=False,
+    ):
+        result[column] = pd.to_numeric(
+            result[column],
+            errors="raise",
+        ).astype("Float64")
+
+    for column in result.columns.intersection(
+        sorted(CITY_DETAIL_PARQUET_INTEGER_COLUMNS),
+        sort=False,
+    ):
+        result[column] = pd.to_numeric(
+            result[column],
+            errors="raise",
+        ).astype("Int64")
+
+    for column in result.columns.intersection(
+        sorted(CITY_DETAIL_PARQUET_BOOLEAN_COLUMNS),
+        sort=False,
+    ):
+        result[column] = result[column].astype("boolean")
+
+    for column in result.columns:
+        dtype = result[column].dtype
+        if (
+            pd.api.types.is_object_dtype(dtype)
+            or pd.api.types.is_string_dtype(dtype)
+            or isinstance(dtype, pd.CategoricalDtype)
+        ):
+            result[column] = result[column].astype("string")
+
+    return result
+
+
+def _write_one_city_customer_detail(
+    detail: pd.DataFrame,
+    output_path: Path,
+    compression: str,
+    overwrite: bool,
+) -> List[Any]:
+    """统一 Schema 后，原子写出单城市客户明细。"""
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"输出文件已存在：{output_path}。"
+            "请改用新目录，或设置 overwrite=True。"
+        )
+
+    temporary_path = output_path.with_name(
+        f".{output_path.name}.tmp"
+    )
+    if temporary_path.exists():
+        temporary_path.unlink()
+
+    try:
+        parquet_detail = _normalize_city_detail_for_parquet(
+            detail,
+            copy=False,
+        )
+        converted_columns = _write_parquet_with_object_fallback(
+            parquet_detail,
+            temporary_path,
+            compression,
+        )
+        temporary_path.replace(output_path)
+        return converted_columns
+    except Exception:
+        if temporary_path.exists():
+            temporary_path.unlink()
+        raise
+
+
+def _continue_grid_ids_for_city_detail(
+    detail: pd.DataFrame,
+    grids: pd.DataFrame,
+    global_grid_sequence_start: int,
+) -> Tuple[pd.DataFrame, int]:
+    """将单城市运行中从 1 重启的 Grid ID 改为全局续编。
+
+    核心算法在全量运行时按城市升序、全局续编。
+    按城市独立调用时每次会从 G000001 重启；本函数
+    只改写准备落盘的客户明细，使成功城市的 ID 顺序
+    与一次性全量运行保持一致。
+    """
+    if grids.empty:
+        return detail, global_grid_sequence_start
+
+    _require_columns(
+        grids,
+        ["grid_id", "city", "admin_code"],
+        "Grid 主表",
+    )
+    _require_columns(detail, ["grid_id"], "客户维度大表")
+
+    old_grid_ids = grids["grid_id"].astype(str).tolist()
+    if len(old_grid_ids) != len(set(old_grid_ids)):
+        raise AssertionError("单城市 Grid 主表存在重复 grid_id。")
+
+    id_mapping: Dict[str, str] = {}
+    next_sequence = int(global_grid_sequence_start)
+    for row in grids[["grid_id", "city", "admin_code"]].itertuples(
+        index=False,
+        name=None,
+    ):
+        old_grid_id, city, admin_code = row
+        id_mapping[str(old_grid_id)] = (
+            f"{_sanitize_id(city)}_"
+            f"{_sanitize_id(admin_code)}_"
+            f"G{next_sequence:06d}"
+        )
+        next_sequence += 1
+
+    assigned_mask = detail["grid_id"].notna()
+    mapped_grid_ids = detail["grid_id"].astype(object).map(id_mapping)
+    unexpected_mask = assigned_mask & mapped_grid_ids.isna()
+    if unexpected_mask.any():
+        examples = detail.loc[unexpected_mask, "grid_id"].head(10).tolist()
+        raise AssertionError(
+            "客户大表中存在 Grid 主表未定义的 grid_id，"
+            f"示例：{examples}"
+        )
+
+    result = detail.copy(deep=False)
+    result["grid_id"] = mapped_grid_ids.where(
+        assigned_mask,
+        detail["grid_id"],
+    )
+    return result, next_sequence
+
+
+def run_satellite_grid_by_city_to_parquet(
+    customer_df: pd.DataFrame,
+    admin_df: pd.DataFrame,
+    existing_grid_df: pd.DataFrame,
+    fyp_threshold_df: pd.DataFrame,
+    distance_df: pd.DataFrame,
+    output_dir: str | Path,
+    cols: Optional[ColumnConfig] = None,
+    config: Optional[AlgorithmConfig] = None,
+    outlet_df: Optional[pd.DataFrame] = None,
+    compression: str = "snappy",
+    overwrite: bool = False,
+    show_progress: bool = True,
+) -> pd.DataFrame:
+    """
+    按客户城市串行运行，每个城市只保存 customer detail。
+
+    完整 customer_df 只需传入一次。程序按规范化后的城市
+    名称升序运行；单城市结果成功写入 Parquet 后立即释放
+    AlgorithmResult，避免所有城市的两张客户大表同时驻留。
+
+    单个城市运行或保存失败时记录原因并继续下一城市。
+    客户城市没有行政边界时，依照全量算法现有口径保存
+    一张所有客户均未分配的明细表。
+
+    返回值是城市运行汇总 DataFrame，不保留各城市的
+    AlgorithmResult。
+    """
+    cols = cols or ColumnConfig()
+    config = config or AlgorithmConfig()
+    _validate_algorithm_config(config)
+
+    customer_required = [
+        cols.customer_id,
+        cols.customer_city,
+        cols.customer_lng,
+        cols.customer_lat,
+        cols.customer_expected_fyp,
+        cols.customer_pred_prob,
+        cols.customer_aoi_id,
+        cols.customer_aoi_lng,
+        cols.customer_aoi_lat,
+    ]
+    if (
+        config.restrict_to_admin_street
+        and config.require_customer_admin_match
+    ):
+        customer_required.append(cols.customer_admin_code)
+    _require_columns(customer_df, customer_required, "客户表")
+    _require_columns(
+        admin_df,
+        [
+            cols.admin_city,
+            cols.admin_code,
+            cols.admin_name,
+            cols.admin_geometry,
+        ],
+        "行政街道表",
+    )
+    _require_columns(
+        existing_grid_df,
+        [cols.existing_city, cols.existing_geometry],
+        "已有基础网格表",
+    )
+    _require_columns(
+        fyp_threshold_df,
+        [cols.threshold_city, cols.threshold_fyp],
+        "城市达标 FYP 表",
+    )
+    _require_columns(
+        distance_df,
+        [cols.distance_city, cols.distance_km],
+        "城市距离表",
+    )
+    if outlet_df is not None:
+        _require_columns(
+            outlet_df,
+            [
+                cols.outlet_secondary_org,
+                cols.outlet_city,
+                cols.outlet_name,
+                cols.outlet_lng,
+                cols.outlet_lat,
+            ],
+            "网点经纬度表",
+        )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    customer_city_values = _normalize_city_series(
+        customer_df[cols.customer_city]
+    )
+    admin_city_values = _normalize_city_series(
+        admin_df[cols.admin_city]
+    )
+    existing_city_values = _normalize_city_series(
+        existing_grid_df[cols.existing_city]
+    )
+    fyp_city_values = _normalize_city_series(
+        fyp_threshold_df[cols.threshold_city]
+    )
+    distance_city_values = _normalize_city_series(
+        distance_df[cols.distance_city]
+    )
+    outlet_city_values = (
+        _normalize_city_series(outlet_df[cols.outlet_city])
+        if outlet_df is not None
+        else None
+    )
+
+    customer_id_conflicts = _cross_city_key_conflict_examples(
+        _normalize_code_series(customer_df[cols.customer_id]),
+        customer_city_values,
+    )
+    aoi_conflicts = _cross_city_key_conflict_examples(
+        _normalize_code_series(customer_df[cols.customer_aoi_id]),
+        customer_city_values,
+    )
+
+    grouped_customers = customer_df.groupby(
+        customer_city_values,
+        sort=True,
+        dropna=False,
+    )
+    city_count = int(customer_city_values.nunique(dropna=False))
+    summary_rows: List[Dict[str, Any]] = []
+    next_global_grid_sequence = 1
+
+    for sequence, (city_value, city_customer_df) in enumerate(
+        grouped_customers,
+        start=1,
+    ):
+        city = str(city_value)
+        started_at = time.perf_counter()
+        safe_city = _sanitize_id(city) or "EMPTY_CITY"
+        output_path = output_dir / (
+            f"{sequence:04d}_{safe_city}_grid_customer_detail.parquet"
+        )
+        city_result: Optional[AlgorithmResult] = None
+        detail: Optional[pd.DataFrame] = None
+
+        if show_progress:
+            print(
+                f"[CITY {sequence}/{city_count}] {city}: "
+                f"开始处理 {len(city_customer_df):,} 行客户"
+            )
+
+        try:
+            candidate_next_grid_sequence = next_global_grid_sequence
+            conflict_messages: List[str] = []
+            if city in customer_id_conflicts:
+                conflict_messages.append(
+                    "customer_id 跨城市冲突示例="
+                    f"{customer_id_conflicts[city]}"
+                )
+            if city in aoi_conflicts:
+                conflict_messages.append(
+                    "AOI_ID 跨城市冲突示例="
+                    f"{aoi_conflicts[city]}"
+                )
+            if conflict_messages:
+                raise ValueError("; ".join(conflict_messages))
+
+            city_admin_df = admin_df.loc[
+                admin_city_values == city
+            ].copy()
+            city_existing_df = existing_grid_df.loc[
+                existing_city_values == city
+            ].copy()
+            city_fyp_df = fyp_threshold_df.loc[
+                fyp_city_values == city
+            ].copy()
+            city_distance_df = distance_df.loc[
+                distance_city_values == city
+            ].copy()
+            city_outlet_df = (
+                outlet_df.loc[outlet_city_values == city].copy()
+                if outlet_df is not None
+                and outlet_city_values is not None
+                else None
+            )
+
+            if city_admin_df.empty:
+                # 即使本城市无行政边界，也继续执行参数、
+                # 已有网格和网点的原有数据校验。
+                prepare_city_parameters(
+                    city_fyp_df,
+                    city_distance_df,
+                    cols,
+                )
+                prepare_existing_occupied_area(
+                    city_existing_df,
+                    cols,
+                    config,
+                )
+                detail = _build_unassigned_customer_detail(
+                    city_customer_df,
+                    city_outlet_df,
+                    cols,
+                    config,
+                )
+                status = "SAVED_UNASSIGNED_NO_ADMIN_BOUNDARY"
+                grid_count = 0
+            else:
+                city_result = run_satellite_grid_algorithm(
+                    customer_df=city_customer_df,
+                    admin_df=city_admin_df,
+                    existing_grid_df=city_existing_df,
+                    fyp_threshold_df=city_fyp_df,
+                    distance_df=city_distance_df,
+                    cols=cols,
+                    config=config,
+                    outlet_df=city_outlet_df,
+                )
+                detail = city_result.grid_customer_detail
+                detail, candidate_next_grid_sequence = (
+                    _continue_grid_ids_for_city_detail(
+                        detail,
+                        city_result.grids,
+                        next_global_grid_sequence,
+                    )
+                )
+                status = "SUCCESS"
+                grid_count = len(city_result.grids)
+
+                # 后续只需要客户大表，写文件前先释放
+                # 该城市的 H3 池、覆盖率等其他大表。
+                del city_result
+                city_result = None
+
+            converted_columns = _write_one_city_customer_detail(
+                detail,
+                output_path,
+                compression,
+                overwrite,
+            )
+            # 只有该城市文件确实写成功后才消耗
+            # 全局 Grid 序号；写出失败的城市视为已跳过。
+            next_global_grid_sequence = candidate_next_grid_sequence
+            if converted_columns:
+                warnings.warn(
+                    f"城市 {city} 的 Parquet 写出时，以下列已仅在"
+                    "保存副本中转为字符串："
+                    f"{list(map(str, converted_columns))}"
+                )
+
+            assigned_count = int(
+                detail["has_successful_grid"].fillna(False).sum()
+            )
+            summary_rows.append(
+                {
+                    "city": city,
+                    "status": status,
+                    "file_saved": True,
+                    "input_row_count": int(len(city_customer_df)),
+                    "output_row_count": int(len(detail)),
+                    "successful_grid_customer_count": assigned_count,
+                    "grid_count": int(grid_count),
+                    "output_file": str(output_path.resolve()),
+                    "elapsed_seconds": float(
+                        time.perf_counter() - started_at
+                    ),
+                    "error_type": None,
+                    "error_message": None,
+                    "parquet_stringified_columns": ",".join(
+                        map(str, converted_columns)
+                    ),
+                }
+            )
+            if show_progress:
+                print(
+                    f"[CITY {sequence}/{city_count}] {city}: "
+                    f"{status} -> {output_path.name}"
+                )
+        except Exception as exc:
+            summary_rows.append(
+                {
+                    "city": city,
+                    "status": "FAILED",
+                    "file_saved": False,
+                    "input_row_count": int(len(city_customer_df)),
+                    "output_row_count": 0,
+                    "successful_grid_customer_count": 0,
+                    "grid_count": 0,
+                    "output_file": None,
+                    "elapsed_seconds": float(
+                        time.perf_counter() - started_at
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                    "parquet_stringified_columns": "",
+                }
+            )
+            if show_progress:
+                first_error_line = str(exc).splitlines()[0]
+                print(
+                    f"[CITY {sequence}/{city_count}] {city}: "
+                    f"FAILED - {type(exc).__name__}: {first_error_line}"
+                )
+        finally:
+            del city_result, detail
+            gc.collect()
+
+    summary_columns = [
+        "city",
+        "status",
+        "file_saved",
+        "input_row_count",
+        "output_row_count",
+        "successful_grid_customer_count",
+        "grid_count",
+        "output_file",
+        "elapsed_seconds",
+        "error_type",
+        "error_message",
+        "parquet_stringified_columns",
+    ]
+    summary = pd.DataFrame(summary_rows, columns=summary_columns)
+
+    if show_progress:
+        failed = summary.loc[summary["status"] == "FAILED"]
+        no_admin = summary.loc[
+            summary["status"]
+            == "SAVED_UNASSIGNED_NO_ADMIN_BOUNDARY"
+        ]
+        print(
+            "[CITY SUMMARY] "
+            f"共 {len(summary):,} 个客户城市，"
+            f"保存 {int(summary['file_saved'].sum()):,} 个文件，"
+            f"失败 {len(failed):,} 个城市。"
+        )
+        if not no_admin.empty:
+            print(
+                "[CITY SUMMARY] 无行政边界、已保存全部未分配明细："
+                + ", ".join(no_admin["city"].astype(str))
+            )
+        if not failed.empty:
+            print("[CITY SUMMARY] 运行失败城市及原因：")
+            for row in failed.itertuples(index=False):
+                first_error_line = str(row.error_message).splitlines()[0]
+                print(
+                    f"  - {row.city}: {row.error_type}: "
+                    f"{first_error_line}"
+                )
+
+    return summary
 
 
 # ============================================================
