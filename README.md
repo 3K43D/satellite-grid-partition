@@ -304,6 +304,23 @@ coordinate_check.to_parquet(
 
 其中 `model_roundtrip_error_m` 仅表示公开模型内部的正反算残差，不能作为相对于真实 WGS84 的误差。
 
+## 同城市最近专员格匹配
+
+`nearest_specialist_grid.py` 是独立工具，可将每个卫星网点 Grid 匹配到同城市最近的现有专员格。两张表的质心坐标必须使用同一坐标系，本项目默认均为 GCJ-02。
+
+```python
+from nearest_specialist_grid import assign_nearest_specialist_grid
+
+nearest_df = assign_nearest_specialist_grid(
+    grid_df,
+    专员格_df,
+)
+
+nearest_df.head()
+```
+
+`grid_df` 默认需要 `grid_id`、`city`、`grid_centroid_gcj02_lng`、`grid_centroid_gcj02_lat`；专员格表默认需要 `专员格id`、`专员格归属网点`、`专员格归属城市`、`专员格质心经度`、`专员格质心纬度`。返回值固定为 `grid_id`、`归属专员格id`、`归属专员格网点` 三列。没有同城候选专员格时，两个归属字段默认留空。
+
 ## 重要数据口径
 
 `H3 映射成功` 不等于 `客户拥有专员格`。正式判断请使用客户大表中的：
