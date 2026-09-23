@@ -28,7 +28,6 @@ def main() -> None:
     specialist_grid_df = pd.DataFrame(
         {
             "专员格id": ["S002", "S001", "S003"],
-            "专员格归属网点": ["西网点", "东网点", "北京网点"],
             "专员格归属城市": ["上海", "上海", "北京"],
             "专员格质心经度": [121.4600, 121.5300, 116.4000],
             "专员格质心纬度": [31.2300, 31.2300, 39.9000],
@@ -43,15 +42,15 @@ def main() -> None:
     assert result.columns.tolist() == [
         "grid_id",
         "归属专员格id",
-        "归属专员格网点",
+        "distance_to_specialist_grid_km",
     ]
     assert result["grid_id"].tolist() == ["G1", "G2", "G3"]
     assert result.loc[0, "归属专员格id"] == "S002"
-    assert result.loc[0, "归属专员格网点"] == "西网点"
     assert result.loc[1, "归属专员格id"] == "S001"
-    assert result.loc[1, "归属专员格网点"] == "东网点"
     assert pd.isna(result.loc[2, "归属专员格id"])
-    assert pd.isna(result.loc[2, "归属专员格网点"])
+    assert 0.9 < result.loc[0, "distance_to_specialist_grid_km"] < 1.0
+    assert 0.9 < result.loc[1, "distance_to_specialist_grid_km"] < 1.0
+    assert pd.isna(result.loc[2, "distance_to_specialist_grid_km"])
 
     tie_grid = pd.DataFrame(
         {

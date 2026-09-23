@@ -24,6 +24,9 @@ import numpy as np
 import pandas as pd
 
 
+EARTH_RADIUS_KM = 6_371.0088
+
+
 def _require_columns(
     df: pd.DataFrame,
     required: list[str],
@@ -112,8 +115,8 @@ def _nearest_candidate_indices(
     candidate_lng: np.ndarray,
     candidate_lat: np.ndarray,
     max_pairwise_elements: int,
-) -> np.ndarray:
-    """按块计算 Haversine 角距离，并返回每个查询点的最近候选下标。"""
+) -> tuple[np.ndarray, np.ndarray]:
+    """按块计算 Haversine 距离，返回最近候选下标及距离（公里）。"""
     candidate_count = len(candidate_lng)
     if candidate_count == 0:
         raise ValueError("候选点不能为空。")
@@ -126,6 +129,7 @@ def _nearest_candidate_indices(
         ),
     )
     winners = np.empty(len(query_lng), dtype=np.int64)
+    winner_distances_km = np.empty(len(query_lng), dtype=np.float64)
 
     candidate_lng_rad = np.radians(candidate_lng)[None, :]
     candidate_lat_rad = np.radians(candidate_lat)[None, :]
@@ -143,13 +147,25 @@ def _nearest_candidate_indices(
             * np.cos(candidate_lat_rad)
             * np.sin(delta_lng / 2.0) ** 2
         )
-        # arcsin 对所有候选点都是单调的，因此直接比较 a 即可。
-        winners[start:end] = np.argmin(
-            np.clip(haversine_a, 0.0, 1.0),
-            axis=1,
+        clipped_a = np.clip(haversine_a, 0.0, 1.0)
+        # 球面距离对 a 单调递增，因此直接用 a 选择最近候选；只对
+        # 最终胜出的候选计算完整距离，避免无谓的矩阵运算。
+        chunk_winners = np.argmin(clipped_a, axis=1)
+        winners[start:end] = chunk_winners
+        winner_a = clipped_a[
+            np.arange(end - start),
+            chunk_winners,
+        ]
+        winner_distances_km[start:end] = (
+            2.0
+            * EARTH_RADIUS_KM
+            * np.arctan2(
+                np.sqrt(winner_a),
+                np.sqrt(1.0 - winner_a),
+            )
         )
 
-    return winners
+    return winners, winner_distances_km
 
 
 def assign_nearest_specialist_grid(
@@ -161,7 +177,6 @@ def assign_nearest_specialist_grid(
     grid_lng_col: str = "grid_centroid_gcj02_lng",
     grid_lat_col: str = "grid_centroid_gcj02_lat",
     specialist_id_col: str = "专员格id",
-    specialist_outlet_col: str = "专员格归属网点",
     specialist_city_col: str = "专员格归属城市",
     specialist_lng_col: str = "专员格质心经度",
     specialist_lat_col: str = "专员格质心纬度",
@@ -178,8 +193,8 @@ def assign_nearest_specialist_grid(
         如果来自客户明细、同一 grid_id 出现多行，只要城市和质心一致，
         函数会自动去重为一行。
     specialist_grid_df
-        现有专员格表。默认字段为 ``专员格id``、``专员格归属网点``、
-        ``专员格归属城市``、``专员格质心经度``、``专员格质心纬度``。
+        现有专员格表。默认字段为 ``专员格id``、``专员格归属城市``、
+        ``专员格质心经度``、``专员格质心纬度``。
     missing_city
         ``"null"``：该城市没有候选专员格时，归属字段留空；
         ``"raise"``：发现这种城市时立即报错。
@@ -189,13 +204,14 @@ def assign_nearest_specialist_grid(
     返回
     ----
     DataFrame
-        严格返回三列：``grid_id``、``归属专员格id``、``归属专员格网点``。
+        严格返回三列：``grid_id``、``归属专员格id``、
+        ``distance_to_specialist_grid_km``。
 
     说明
     ----
     - 只会在相同城市内匹配；不会跨城市寻找候选。
     - 两边坐标必须使用同一坐标系，本项目默认均为 GCJ-02。
-    - 距离相同时，按专员格 ID 升序、网点名称升序、原始行序选择。
+    - 距离相同时，按专员格 ID 升序、原始行序选择。
     """
     if missing_city not in {"null", "raise"}:
         raise ValueError("missing_city 只能是 'null' 或 'raise'。")
@@ -210,7 +226,6 @@ def assign_nearest_specialist_grid(
     ]
     specialist_required = [
         specialist_id_col,
-        specialist_outlet_col,
         specialist_city_col,
         specialist_lng_col,
         specialist_lat_col,
@@ -224,7 +239,11 @@ def assign_nearest_specialist_grid(
 
     if grid_df.empty:
         return pd.DataFrame(
-            columns=["grid_id", "归属专员格id", "归属专员格网点"]
+            columns=[
+                "grid_id",
+                "归属专员格id",
+                "distance_to_specialist_grid_km",
+            ]
         )
 
     grid = grid_df[grid_required].copy()
@@ -268,9 +287,6 @@ def assign_nearest_specialist_grid(
     specialist["_specialist_id_norm"] = _normalize_text(
         specialist[specialist_id_col]
     )
-    specialist["_outlet_sort"] = _normalize_text(
-        specialist[specialist_outlet_col]
-    )
     specialist["_city_norm"] = _normalize_text(
         specialist[specialist_city_col]
     )
@@ -300,7 +316,6 @@ def assign_nearest_specialist_grid(
             "_city_norm",
             "_lng",
             "_lat",
-            specialist_outlet_col,
         ],
         "specialist_grid_df",
     )
@@ -308,16 +323,14 @@ def assign_nearest_specialist_grid(
         [
             "_city_norm",
             "_specialist_id_norm",
-            "_outlet_sort",
             "_row_order",
         ],
         kind="mergesort",
     ).reset_index(drop=True)
 
     assigned_ids = np.empty(len(grid), dtype=object)
-    assigned_outlets = np.empty(len(grid), dtype=object)
     assigned_ids[:] = pd.NA
-    assigned_outlets[:] = pd.NA
+    assigned_distances_km = np.full(len(grid), np.nan, dtype=np.float64)
 
     specialists_by_city = {
         str(city): group.reset_index(drop=True)
@@ -337,7 +350,7 @@ def assign_nearest_specialist_grid(
             missing_cities.append(city_key)
             continue
 
-        winners = _nearest_candidate_indices(
+        winners, winner_distances_km = _nearest_candidate_indices(
             city_grid["_lng"].to_numpy(dtype=np.float64),
             city_grid["_lat"].to_numpy(dtype=np.float64),
             candidates["_lng"].to_numpy(dtype=np.float64),
@@ -347,9 +360,7 @@ def assign_nearest_specialist_grid(
         assigned_ids[positions] = candidates.iloc[winners][
             specialist_id_col
         ].to_numpy(dtype=object)
-        assigned_outlets[positions] = candidates.iloc[winners][
-            specialist_outlet_col
-        ].to_numpy(dtype=object)
+        assigned_distances_km[positions] = winner_distances_km
 
     if missing_cities and missing_city == "raise":
         raise ValueError(
@@ -361,7 +372,7 @@ def assign_nearest_specialist_grid(
         {
             "grid_id": grid[grid_id_col].to_numpy(copy=False),
             "归属专员格id": assigned_ids,
-            "归属专员格网点": assigned_outlets,
+            "distance_to_specialist_grid_km": assigned_distances_km,
         }
     )
 

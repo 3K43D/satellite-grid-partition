@@ -319,7 +319,7 @@ nearest_df = assign_nearest_specialist_grid(
 nearest_df.head()
 ```
 
-`grid_df` 默认需要 `grid_id`、`city`、`grid_centroid_gcj02_lng`、`grid_centroid_gcj02_lat`；专员格表默认需要 `专员格id`、`专员格归属网点`、`专员格归属城市`、`专员格质心经度`、`专员格质心纬度`。返回值固定为 `grid_id`、`归属专员格id`、`归属专员格网点` 三列。没有同城候选专员格时，两个归属字段默认留空。
+`grid_df` 默认需要 `grid_id`、`city`、`grid_centroid_gcj02_lng`、`grid_centroid_gcj02_lat`；专员格表默认需要 `专员格id`、`专员格归属城市`、`专员格质心经度`、`专员格质心纬度`。返回值固定为 `grid_id`、`归属专员格id`、`distance_to_specialist_grid_km` 三列，其中距离是两个质心之间的 Haversine 球面直线距离（公里）。没有同城候选专员格时，归属 ID 为空、距离为 `NaN`。
 
 ## 重要数据口径
 
